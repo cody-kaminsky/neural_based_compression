@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from compressai.entropy_models import GaussianConditional, EntropyBottleneck
 
 from train.modules.analysis import AnalysisNet
@@ -19,12 +20,21 @@ class NeuralEncoderModel(nn.Module):
         self.entropy_bottleneck = EntropyBottleneck(64)
 
     def forward(self, x):
+        # Pad to multiple of 64 (required by 3x stride-2 analysis + 1x stride-2 hyper)
+        h, w = x.shape[2], x.shape[3]
+        pad_h = (64 - h % 64) % 64
+        pad_w = (64 - w % 64) % 64
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
         y = self.analysis_net(x)
         z = self.hyper_analysis(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         scales = self.hyper_synthesis(z_hat)
         y_hat, y_likelihoods = self.gaussian_conditional(y, scales)
         x_hat = self.synthesis_net(y_hat)
+
+        x_hat = x_hat[:, :, :h, :w]
         return {
             "x_hat": x_hat,
             "y_likelihoods": y_likelihoods,
