@@ -18,7 +18,7 @@ echo "=== Downloading COCO 2017 train images ==="
 mkdir -p $WORKSPACE/dataset/raw
 cd $WORKSPACE/dataset/raw
 wget -q --show-progress -O coco_train2017.zip "http://images.cocodataset.org/zips/train2017.zip"
-unzip -q coco_train2017.zip -d .
+python3 -c "import zipfile; zipfile.ZipFile('coco_train2017.zip').extractall('.')"
 rm coco_train2017.zip
 echo "COCO 2017 downloaded."
 
