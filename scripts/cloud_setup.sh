@@ -2,10 +2,22 @@
 # Cloud instance setup for neural_based_compression training.
 # Tested on Ubuntu with CUDA pre-installed (RunPod / Vast.ai).
 # Requires a pod with 3 GPUs. On RunPod, select '3x RTX 4090' under GPU count when creating the pod.
+#
+# Dataset options:
+#   UAVid (default, recommended):
+#     1. Register at https://uavid.nl — free, approval is fast
+#     2. You will receive an email with a direct download link
+#     3. Before running this script, set the URL:
+#          export UAVID_URL="<your-link-from-email>"
+#        Or add it as a RunPod environment variable in the pod settings UI.
+#
+#   VisDrone (fallback, no registration required):
+#     export DATASET_SOURCE=visdrone
 set -euo pipefail
 
 REPO_URL="https://github.com/cody-kaminsky/neural_based_compression"
-DATASET_SOURCE="${DATASET_SOURCE:-visdrone}"
+DATASET_SOURCE="${DATASET_SOURCE:-uavid}"
+UAVID_URL="${UAVID_URL:-}"
 
 # ---------------------------------------------------------------------------
 # 1. Python dependencies
@@ -28,26 +40,24 @@ git pull origin master
 # ---------------------------------------------------------------------------
 mkdir -p dataset/raw logs
 
-case "$DATASET_SOURCE" in
-    visdrone)
-        echo "==> Downloading VisDrone-VID"
-        VISDRONE_URL="https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-train.zip"
-        wget -q --show-progress -O dataset/raw/visdrone_train.zip "$VISDRONE_URL"
-        unzip -q dataset/raw/visdrone_train.zip -d dataset/raw/
-        rm dataset/raw/visdrone_train.zip
-        ;;
-    uavid)
-        echo "==> UAVid requires manual download (registration required)."
-        echo "    1. Register at https://uavid.nl"
-        echo "    2. Download the video dataset and place .mp4 files under dataset/raw/"
-        echo "    3. Re-run this script with DATASET_SOURCE=uavid after placing files."
-        exit 0
-        ;;
-    *)
-        echo "ERROR: Unknown DATASET_SOURCE='$DATASET_SOURCE'. Use 'visdrone' or 'uavid'." >&2
-        exit 1
-        ;;
-esac
+# UAVid download — set UAVID_URL to the download link from your registration email
+# Export this before running: export UAVID_URL="https://..."
+if [ -n "$UAVID_URL" ]; then
+    echo "==> Downloading UAVid..."
+    wget -O uavid.zip "$UAVID_URL"
+    unzip uavid.zip -d dataset/raw/
+    rm uavid.zip
+elif [ "$DATASET_SOURCE" = "visdrone" ]; then
+    echo "==> Downloading VisDrone-VID..."
+    wget -O visdrone_train.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-train.zip"
+    wget -O visdrone_val.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-val.zip"
+    unzip visdrone_train.zip -d dataset/raw/
+    unzip visdrone_val.zip -d dataset/raw/
+    rm visdrone_train.zip visdrone_val.zip
+else
+    echo "No dataset source set. Set UAVID_URL or DATASET_SOURCE=visdrone"
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Extract frames at 1 fps
