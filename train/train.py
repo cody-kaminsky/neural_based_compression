@@ -9,7 +9,9 @@ Usage:
         --lr 1e-4 \\
         --workers 4 \\
         --output-dir checkpoints/ \\
-        --resume checkpoints/last.pth
+        --resume checkpoints/last.pth \\
+        --amp \\
+        --amp-dtype bfloat16
 """
 
 import argparse
@@ -43,7 +45,7 @@ from train.dataset_utils import yuv_to_rgb
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train neural compression model")
-    p.add_argument("--data", required=True, help="Root directory of training images")
+    p.add_argument("--data", default=None, help="Root directory of training images")
     p.add_argument("--lmbda", type=float, default=0.05, help="Rate-distortion tradeoff λ")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
@@ -52,7 +54,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="checkpoints/")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     p.add_argument("--patch-size", type=int, default=256)
-    return p.parse_args()
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable automatic mixed precision")
+    p.add_argument("--amp-dtype", default="bfloat16", choices=["bfloat16", "float16"],
+                   help="AMP dtype (bfloat16 recommended; float16 adds GradScaler)")
+    p.add_argument("--data-dir", default=None, help="Alias for --data (cloud setup compat)")
+    p.add_argument("--checkpoint-dir", default=None, help="Alias for --output-dir (cloud setup compat)")
+    args = p.parse_args()
+    if args.data_dir is not None and args.data is None:
+        args.data = args.data_dir
+    if args.checkpoint_dir is not None:
+        args.output_dir = args.checkpoint_dir
+    if args.data is None:
+        p.error("--data or --data-dir is required")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +116,17 @@ def save_checkpoint(state: dict, path: str) -> None:
     torch.save(state, path)
 
 
-def load_checkpoint(path: str, model: nn.Module, optimizer: Adam) -> int:
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: Adam,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+) -> int:
     ckpt = torch.load(path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
     return ckpt.get("epoch", 0)
 
 
@@ -120,6 +142,9 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     writer: SummaryWriter,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -129,13 +154,22 @@ def train_one_epoch(
         x = x.to(device)
         optimizer.zero_grad()
 
-        out = model(x)
-        loss, metrics = compute_loss(
-            x, out["x_hat"], out["y_likelihoods"], out["z_likelihoods"], lmbda
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            out = model(x)
+            loss, metrics = compute_loss(
+                x, out["x_hat"], out["y_likelihoods"], out["z_likelihoods"], lmbda
+            )
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
         total_loss += metrics["loss"]
 
@@ -182,6 +216,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
+    amp_enabled = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if (amp_enabled and amp_dtype == torch.float16) else None
+    print(f"AMP: {'enabled' if amp_enabled else 'disabled'}"
+          + (f" ({args.amp_dtype})" if amp_enabled else "")
+          + (" + GradScaler" if scaler is not None else ""))
+
     train_ds = AerialVideoDataset(args.data, patch_size=args.patch_size, split="train")
     val_ds = AerialVideoDataset(args.data, patch_size=args.patch_size, split="val")
 
@@ -200,7 +241,7 @@ def main() -> None:
 
     start_epoch = 0
     if args.resume and os.path.isfile(args.resume):
-        start_epoch = load_checkpoint(args.resume, model, optimizer)
+        start_epoch = load_checkpoint(args.resume, model, optimizer, scaler)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -210,7 +251,8 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, args.lmbda, device, epoch, writer
+            model, train_loader, optimizer, args.lmbda, device, epoch, writer,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
         )
         val_metrics = validate(model, val_loader, args.lmbda, device)
         scheduler.step()
@@ -234,6 +276,7 @@ def main() -> None:
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "val_loss": val_metrics["loss"],
+            "scaler": scaler.state_dict() if scaler is not None else None,
         }
 
         save_checkpoint(checkpoint, os.path.join(args.output_dir, "last.pth"))
