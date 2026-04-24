@@ -1,8 +1,50 @@
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
-.pytest_cache/
+*.egg
 *.egg-info/
 dist/
 build/
+.eggs/
+*.so
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
 .env
+
+# Checkpoints and model weights
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Reference vectors (large binary data)
+reference_vectors/*.npy
+reference_vectors/*.npz
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+runs/
+tb_logs/
+
+# OS
+.DS_Store
+Thumbs.db
