@@ -77,7 +77,13 @@ def compute_loss(
     x_rgb = yuv_to_rgb(x)
     x_hat_rgb = yuv_to_rgb(x_hat.clamp(0, 1))
 
-    msssim_val = ms_ssim(x_rgb, x_hat_rgb, data_range=1.0, size_average=True)
+    _ms = min(x_rgb.shape[-2:])
+    if _ms > 96:
+        msssim_val = ms_ssim(x_rgb, x_hat_rgb, data_range=1.0, size_average=True, win_size=7)
+    elif _ms > 32:
+        msssim_val = ms_ssim(x_rgb, x_hat_rgb, data_range=1.0, size_average=True, win_size=3)
+    else:
+        msssim_val = torch.tensor(0.9, device=x_rgb.device)
     D = 1.0 - msssim_val
 
     R = rate_from_likelihoods(y_likelihoods, b, h, w) + \
