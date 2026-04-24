@@ -2,22 +2,10 @@
 # Cloud instance setup for neural_based_compression training.
 # Tested on Ubuntu with CUDA pre-installed (RunPod / Vast.ai).
 # Requires a pod with 3 GPUs. On RunPod, select '3x RTX 4090' under GPU count when creating the pod.
-#
-# Dataset options:
-#   UAVid (default, recommended):
-#     1. Register at https://uavid.nl — free, approval is fast
-#     2. You will receive an email with a direct download link
-#     3. Before running this script, set the URL:
-#          export UAVID_URL="<your-link-from-email>"
-#        Or add it as a RunPod environment variable in the pod settings UI.
-#
-#   VisDrone (fallback, no registration required):
-#     export DATASET_SOURCE=visdrone
+# No configuration required — downloads VisDrone-VID train and val splits automatically.
 set -euo pipefail
 
 REPO_URL="https://github.com/cody-kaminsky/neural_based_compression"
-DATASET_SOURCE="${DATASET_SOURCE:-uavid}"
-UAVID_URL="${UAVID_URL:-}"
 
 # ---------------------------------------------------------------------------
 # 1. Python dependencies
@@ -40,24 +28,12 @@ git pull origin master
 # ---------------------------------------------------------------------------
 mkdir -p dataset/raw logs
 
-# UAVid download — set UAVID_URL to the download link from your registration email
-# Export this before running: export UAVID_URL="https://..."
-if [ -n "$UAVID_URL" ]; then
-    echo "==> Downloading UAVid..."
-    wget -O uavid.zip "$UAVID_URL"
-    unzip uavid.zip -d dataset/raw/
-    rm uavid.zip
-elif [ "$DATASET_SOURCE" = "visdrone" ]; then
-    echo "==> Downloading VisDrone-VID..."
-    wget -O visdrone_train.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-train.zip"
-    wget -O visdrone_val.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-val.zip"
-    unzip visdrone_train.zip -d dataset/raw/
-    unzip visdrone_val.zip -d dataset/raw/
-    rm visdrone_train.zip visdrone_val.zip
-else
-    echo "No dataset source set. Set UAVID_URL or DATASET_SOURCE=visdrone"
-    exit 1
-fi
+echo "==> Downloading VisDrone-VID"
+wget -O visdrone_train.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-train.zip"
+wget -O visdrone_val.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-val.zip"
+unzip visdrone_train.zip -d dataset/raw/
+unzip visdrone_val.zip -d dataset/raw/
+rm visdrone_train.zip visdrone_val.zip
 
 # ---------------------------------------------------------------------------
 # 4. Extract frames at 1 fps
