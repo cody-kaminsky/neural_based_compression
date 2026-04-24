@@ -77,7 +77,11 @@ def compute_loss(
     x_rgb = yuv_to_rgb(x)
     x_hat_rgb = yuv_to_rgb(x_hat.clamp(0, 1))
 
-    msssim_val = ms_ssim(x_rgb, x_hat_rgb, data_range=1.0, size_average=True)
+    if min(x_rgb.shape[-2], x_rgb.shape[-1]) < 112:
+        from pytorch_msssim import ssim as ssim_fn
+        msssim_val = ssim_fn(x_rgb, x_hat_rgb, data_range=1.0, size_average=True, win_size=7)
+    else:
+        msssim_val = ms_ssim(x_rgb, x_hat_rgb, data_range=1.0, size_average=True, win_size=7)
     D = 1.0 - msssim_val
 
     R = rate_from_likelihoods(y_likelihoods, b, h, w) + \
