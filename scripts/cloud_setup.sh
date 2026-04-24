@@ -8,6 +8,9 @@ set -euo pipefail
 WORKSPACE=/workspace
 REPO_DIR=$WORKSPACE/neural_based_compression
 
+echo "=== Installing system dependencies ==="
+apt-get install -y unzip ffmpeg
+
 echo "=== Installing Python dependencies ==="
 pip install -q compressai brevitas pytorch-msssim tensorboard onnx onnxruntime pillow tqdm pandas scipy
 
