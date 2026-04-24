@@ -11,29 +11,45 @@ REPO_DIR=$WORKSPACE/neural_based_compression
 echo "=== Installing Python dependencies ==="
 pip install -q compressai brevitas pytorch-msssim tensorboard onnx onnxruntime pillow tqdm pandas scipy
 
-echo "=== Downloading VisDrone-VID dataset ==="
+echo "=== Downloading COCO 2017 train images ==="
 mkdir -p $WORKSPACE/dataset/raw
 cd $WORKSPACE/dataset/raw
-wget -q --show-progress -O visdrone_train.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-train.zip"
-wget -q --show-progress -O visdrone_val.zip "https://github.com/VisDrone/VisDrone-Dataset/releases/download/v1.0/VisDrone2019-VID-val.zip"
-unzip -q visdrone_train.zip -d .
-unzip -q visdrone_val.zip -d .
-rm visdrone_train.zip visdrone_val.zip
-echo "Dataset downloaded and extracted."
+wget -q --show-progress -O coco_train2017.zip "http://images.cocodataset.org/zips/train2017.zip"
+unzip -q coco_train2017.zip -d .
+rm coco_train2017.zip
+echo "COCO 2017 downloaded."
 
-echo "=== Extracting frames at 1fps ==="
+echo "=== Organizing dataset ==="
+# COCO images are flat (no sequence structure), create synthetic sequences of 100 images each
 cd $WORKSPACE
-mkdir -p dataset/frames
-for f in $(find dataset/raw -name "*.mp4" -o -name "*.avi" -o -name "*.MOV" 2>/dev/null); do
-    seq=$(basename $(dirname "$f"))_$(basename "${f%.*}")
-    mkdir -p "dataset/frames/$seq"
-    ffmpeg -i "$f" -vf fps=1 -q:v 1 "dataset/frames/$seq/%06d.png" -y -loglevel error
-done
-echo "Frame extraction complete."
+python3 - <<'EOF'
+import os, shutil
+from pathlib import Path
 
-echo "=== Splitting dataset into train/val ==="
-cd $REPO_DIR
-python scripts/split_dataset.py $WORKSPACE/dataset/frames $WORKSPACE/dataset/train $WORKSPACE/dataset/val
+src = Path("/workspace/dataset/raw/train2017")
+images = sorted(src.glob("*.jpg"))
+seq_size = 100
+train_dir = Path("/workspace/dataset/train")
+val_dir = Path("/workspace/dataset/val")
+
+# Split: last 10% of sequences to val
+sequences = [images[i:i+seq_size] for i in range(0, len(images), seq_size)]
+n_val = max(1, len(sequences) // 10)
+train_seqs = sequences[:-n_val]
+val_seqs = sequences[-n_val:]
+
+for split_seqs, split_dir in [(train_seqs, train_dir), (val_seqs, val_dir)]:
+    for i, seq in enumerate(split_seqs):
+        seq_dir = split_dir / f"seq_{i:04d}"
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        for img in seq:
+            dst = seq_dir / img.name
+            if not dst.exists():
+                shutil.copy2(img, dst)
+
+print(f"Train: {len(train_seqs)} sequences, Val: {len(val_seqs)} sequences")
+EOF
+echo "Dataset organized."
 
 echo "=== Starting training (3 models in parallel, one per GPU) ==="
 mkdir -p $WORKSPACE/checkpoints/lmbda_0.001 $WORKSPACE/checkpoints/lmbda_0.005 $WORKSPACE/checkpoints/lmbda_0.01
