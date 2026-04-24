@@ -1,0 +1,494 @@
+================================================================================
+NEURAL AUTOENCODER VIDEO ENCODER — VHDL ARCHITECTURE REFERENCE
+Learned Image Compression for FPGA (Xilinx UltraScale+ / Zynq)
+Target: 1080p @ 30fps, 200 MHz clock, ZU3EG or equivalent
+================================================================================
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+This FPGA encoder implements a learned image compression pipeline based on a
+convolutional autoencoder with a scale hyperprior entropy model (Ballé et al.,
+NeurIPS 2018). It is designed as a drop-in replacement for the DCT-based encoder
+in ../architecture_reference.txt, sharing the same AXI-Stream video input and
+bitstream output interfaces.
+
+Key design choices vs. naive neural compression:
+
+  Strip-based processing
+    Input is processed in 64-row horizontal strips rather than full frames.
+    Eliminates the full-frame startup latency caused by the conv receptive field.
+    Strip height (64 rows) is chosen to exceed the vertical receptive field of
+    the 3-stage analysis network (~30 pixels) with margin for border padding.
+
+  Factorized + scale hyperprior entropy model, no autoregressive context
+    Autoregressive (pixel-sequential) context models are fundamentally serial
+    and cannot be parallelised on FPGA. The scale hyperprior provides most of
+    the coding gain of the autoregressive model at much lower cost.
+    Each latent channel's distribution is parameterised by a per-symbol scale
+    factor derived from the hyperprior — this can be computed strip-by-strip
+    and looked up per symbol, enabling fully streaming entropy coding.
+
+  Depthwise separable convolutions (DSConv)
+    Replaces all 3-stage standard conv layers with depthwise separable blocks
+    (depthwise 3x3 + pointwise 1x1), reducing MAC count ~9x versus standard
+    convolution at minimal quality cost.
+
+  INT8 quantization (weights and activations)
+    Post-training INT8 quantization for the conv backbone, validated via
+    quantization-aware training (QAT) using the CompressAI framework.
+    Two INT8 multiplies per DSP48E2 using cascade packing.
+
+  Parallel ANS entropy coding (64 streams)
+    Asymmetric Numeral Systems (ANS) replaces arithmetic coding.
+    64 independent ANS encoder instances operate on interleaved latent
+    channels in parallel, reducing entropy coding latency ~64x.
+
+  Input:   AXI-Stream 8-bit YUV 4:2:0, up to 1080p (3840x2160 future)
+  Output:  AXI-Stream compressed bitstream (bytes, frame-delimited)
+  Control: AXI-Lite register interface (from Zynq PS)
+
+  No motion estimation. Intra-only (I-frame only) in v1.0.
+  P-frame temporal coding is planned for v2.0 (lightweight optical flow).
+
+================================================================================
+2. MODULE HIERARCHY
+================================================================================
+
+neural_enc_top                  Top-level orchestration
+├── enc_ctrl                    AXI-Lite control register interface (reused)
+├── strip_ctrl                  Strip sequencer: drives 64-row strip pipeline
+├── pixel_buffer                Input strip BRAM buffer (64 rows × frame_width)
+├── analysis_net                3-stage DSConv analysis transform (encoder CNN)
+│   ├── dsconv_stage0           Stage 0: 3ch → 64ch, stride-2, 3x3 DSConv
+│   ├── dsconv_stage1           Stage 1: 64ch → 96ch, stride-2, 3x3 DSConv
+│   └── dsconv_stage2           Stage 2: 96ch → 128ch, stride-2, 3x3 DSConv
+├── hyper_analysis              Hyperprior analysis: 128ch → 64ch (2-stage)
+├── quantizer                   Uniform quantizer: latent y → integer ŷ
+├── hyper_synthesis             Hyperprior synthesis: 64ch → 128ch scale params
+├── entropy_params              Per-symbol scale lookup: ŷ → (μ, σ) pairs
+├── ans_encoder                 64-stream parallel ANS entropy coder
+├── bs_packer                   Bitstream packer and framer (reused/adapted)
+└── weight_rom                  Packed INT8 weight ROM (all stages, ~80 KB)
+
+Decoder (ground station software — not implemented in FPGA):
+  Python / C++ using CompressAI or custom ONNX runtime
+  ANS decode → entropy decode → synthesis_net → reconstructed pixels
+
+================================================================================
+3. MODULE DESCRIPTIONS
+================================================================================
+
+--------------------------------------------------------------------------------
+strip_ctrl.vhd — Strip Sequencer (~150 lines)
+--------------------------------------------------------------------------------
+Coordinates the 64-row strip pipeline. Monitors AXI-Stream video input and
+asserts strip_rdy when pixel_buffer has accumulated 64 complete rows.
+Drives handshaking between pixel_buffer, analysis_net, and ans_encoder.
+
+Strip overlap: last 2 rows of strip N are prepended to strip N+1 as border
+context for the stage-0 convolution (avoids discontinuity at strip boundaries).
+This requires pixel_buffer to retain the last 2 rows after each strip flush.
+
+Signals:
+  strip_start    Pulse: begin processing current strip
+  strip_done     Pulse from ans_encoder: strip bitstream complete
+  strip_y        Current strip's top Y coordinate (for metadata header)
+  last_strip     Asserted on final strip of frame
+
+FSM: IDLE → ACCUMULATE → WAIT_HYPER → ENCODE_Y → FLUSH
+
+Resource estimate: ~200 LUTs, ~150 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+pixel_buffer.vhd — Input Strip Buffer (~180 lines)
+--------------------------------------------------------------------------------
+Dual-port BRAM buffer. Write side accepts AXI-Stream pixel input (one byte/clock,
+YUV 4:2:0 raster order). Read side provides 8-pixel-wide rows to analysis_net
+stage 0 on demand.
+
+Stores 64 rows × frame_width pixels (Y channel) plus 32 rows × frame_width/2
+(Cb and Cr at 4:2:0). Currently processes luma only; chroma path planned v1.1.
+
+Capacity: 64 × 1280 × 1B (luma) = 80 KB → 2× RAMB36E2 (ping-pong)
+The two RAMB36E2 alternate: one fills while the other drains to analysis_net.
+
+Resource estimate: ~150 LUTs, ~100 FFs, 0 DSP, 4 BRAM36
+
+--------------------------------------------------------------------------------
+analysis_net.vhd — 3-Stage Analysis Transform (~600 lines)
+--------------------------------------------------------------------------------
+Streaming convolutional encoder. Processes pixel_buffer output one row at a time
+using line-buffer-based convolution (no full feature map buffering required).
+
+Architecture per stage:
+  Line buffer (2 rows × width × channels × INT8) stored in BRAM
+  Depthwise conv (3x3, one filter per input channel) using DSP MAC array
+  Leaky ReLU activation (slope 0.1 for x<0) — trivial in LUTs
+  Pointwise conv (1x1, Cin × Cout) using DSP MAC array
+  Stride-2 subsampling: emit every other output row/column
+
+Stage dimensions and throughput (at 200 MHz, 1080p):
+  Stage 0: in  1280×64×3    out  640×32×64    ~20 DSPs
+  Stage 1: in   640×32×64   out  320×16×96    ~ 6 DSPs
+  Stage 2: in   320×16×96   out  160× 8×128   ~ 3 DSPs
+
+Line buffers (BRAM):
+  Stage 0 input  → stage 1:  3 rows × 640 × 64ch × 1B = 123 KB → 27 BRAM36
+  Stage 1 output → stage 2:  3 rows × 320 × 96ch × 1B =  92 KB → 20 BRAM36
+  Stage 2 output (latent y): 1 strip ×160 × 128ch × 1B =  20 KB →  5 BRAM36
+
+Weight storage: INT8 weights loaded from weight_rom at startup into local BRAM
+  Stage 0 depthwise:   3×3×3    =      27 B
+  Stage 0 pointwise:   3×64     =     192 B
+  Stage 1 depthwise:   3×3×64   =     576 B
+  Stage 1 pointwise:   64×96    =   6,144 B
+  Stage 2 depthwise:   3×3×96   =     864 B
+  Stage 2 pointwise:   96×128   =  12,288 B
+  Total analysis:               ~  20 KB → 5 BRAM36
+
+Resource estimate: ~12,000 LUTs, ~4,000 FFs, ~30 DSP, ~57 BRAM36
+
+--------------------------------------------------------------------------------
+hyper_analysis.vhd — Hyperprior Analysis (~200 lines)
+--------------------------------------------------------------------------------
+2-stage sub-network that encodes the latent y into a compact side-information
+vector z. Runs once per strip immediately after analysis_net completes.
+
+Architecture: abs(y) → Conv 3x3/1 (128→64) → ReLU → Conv 3x3/2 (64→64) → z
+
+z dimensions per strip: 160×8×64 → 80×4×64 (after stride-2 stage)
+z is quantized and entropy-coded using the factorized entropy model (separate
+simpler lookup-table based coder, not the ANS array used for y).
+z bitstream is prepended to the y bitstream in each strip packet so the decoder
+can reconstruct the scale parameters before decoding y.
+
+Weight storage: ~8 KB → 2 BRAM36
+Line buffer:    3 rows × 80 × 64ch × 1B = 15 KB → 4 BRAM36
+
+Resource estimate: ~2,000 LUTs, ~800 FFs, ~8 DSP, ~6 BRAM36
+
+--------------------------------------------------------------------------------
+hyper_synthesis.vhd — Hyperprior Synthesis (~200 lines)
+--------------------------------------------------------------------------------
+Decodes z back into per-symbol scale parameters σ for the entropy model.
+Mirrors hyper_analysis: upsamples z through 2 transposed conv stages.
+Output: 160×8×128 scale map σ (one value per latent symbol ŷ).
+
+σ values are quantized to 8 bits (log-scale) for compact storage during
+the y encoding pass. Stored in a 160×8×128 BRAM as the y encoding proceeds.
+
+Resource estimate: ~2,000 LUTs, ~800 FFs, ~8 DSP, ~8 BRAM36
+
+--------------------------------------------------------------------------------
+quantizer.vhd — Uniform Quantizer (~80 lines)
+--------------------------------------------------------------------------------
+Rounds real-valued latent activations to nearest integer: ŷ = round(y).
+Implemented as a simple round-half-up on the fractional fixed-point
+representation from analysis_net (Q8.8 internal representation).
+No division required. 1-cycle latency per symbol.
+
+Also computes the residual r = y - ŷ for potential soft-quantization paths
+(planned future work).
+
+Resource estimate: ~100 LUTs, ~50 FFs, 0 DSP, 0 BRAM
+
+--------------------------------------------------------------------------------
+entropy_params.vhd — Per-Symbol Parameter Lookup (~120 lines)
+--------------------------------------------------------------------------------
+For each quantized symbol ŷ[c,x,y], looks up the corresponding scale parameter
+σ[c,x,y] from hyper_synthesis output. Computes the probability mass:
+
+  P(ŷ) = CDF(ŷ + 0.5 | 0, σ) - CDF(ŷ - 0.5 | 0, σ)
+
+where CDF is the Gaussian (or Laplace) CDF, pre-tabulated for 256 σ values
+and 512 symbol values in a 256×512 lookup ROM (131 KB — split across BRAM).
+
+Output: 12-bit probability p[c,x,y] in Q0.12 fixed point for ANS encoder.
+
+Gaussian CDF ROM: 256 × 512 × 12-bit = 196,608 bytes → ~48 BRAM18 = 24 BRAM36
+
+Note: This is the largest single BRAM consumer. Can be reduced to ~12 BRAM36
+by using Laplace instead of Gaussian (symmetric, needs only half the table)
+or by interpolating a coarser table (64 σ entries, interpolate at runtime).
+
+Resource estimate: ~500 LUTs, ~200 FFs, 0 DSP, ~24 BRAM36
+
+--------------------------------------------------------------------------------
+ans_encoder.vhd — 64-Stream Parallel ANS Entropy Coder (~400 lines)
+--------------------------------------------------------------------------------
+Core entropy coding engine. Implements 64 independent rANS (range ANS) encoder
+instances operating on interleaved latent channels.
+
+The 128 latent channels are round-robin assigned to 64 ANS streams (2 channels
+per stream). Each stream encodes symbols independently; outputs are interleaved
+in the bitstream so the decoder can reconstruct them with 64 parallel decoders.
+
+Per-stream rANS state: 32-bit integer x in [L, bL) where L = 2^23, b = 2^8
+Encoding step: x' = (x / p) * M + offset(sym, p)
+  where p = probability from entropy_params, M = 2^12 (probability precision)
+
+Each ANS encoder instance: ~100 LUTs + 1 DSP (for the division-by-p step,
+implemented as multiply-by-reciprocal using a 256-entry LUT).
+
+Output: 64 streams of variable-length bitstream chunks, multiplexed to
+bs_packer in round-robin order.
+
+Latency: One symbol per clock per stream = 1 clock throughput at full pipeline.
+Total entropy coding latency for one strip (160×8×128 symbols = 163,840):
+  163,840 / 64 streams = 2,560 clocks ≈ 12.8 µs at 200 MHz.
+
+Resource estimate: ~8,000 LUTs, ~3,000 FFs, ~64 DSP, ~8 BRAM36
+
+--------------------------------------------------------------------------------
+weight_rom.vhd — Packed INT8 Weight ROM (~100 lines)
+--------------------------------------------------------------------------------
+Stores all network weights for analysis_net, hyper_analysis, hyper_synthesis in
+a single packed BRAM array. Weights are loaded into local BRAMs of each
+sub-module at startup (one-time configuration) via a DMA-style sequencer.
+
+Weight packing: 4 INT8 weights per 32-bit BRAM word.
+Total weights (analysis + hyper): ~48 KB → 12 BRAM36.
+
+At startup the PS ARM core can update weights via AXI-Lite DMA to support
+switching between multiple trained models (different rate-distortion points
+or scene-adapted models).
+
+Resource estimate: ~200 LUTs, ~100 FFs, 0 DSP, 12 BRAM36
+
+================================================================================
+4. DATA FLOW
+================================================================================
+
+  Video Input (AXI-Stream 8-bit YUV 4:2:0)
+        |
+        v
+  pixel_buffer  [Accumulate 64 rows; ping-pong BRAM]
+        |
+        | strip_start pulse (every 64 rows)
+        v
+  analysis_net  [3-stage DSConv, streaming row-by-row]
+        |
+        +--[y latent, 160×8×128 INT8]----> quantizer -----> ŷ stored in BRAM
+        |                                                         |
+        v                                                         |
+  hyper_analysis  [2-stage, runs on ŷ]                           |
+        |                                                         |
+        v                                                         |
+  [z latent, 80×4×64 INT8]                                        |
+        |                                                         |
+        v                                                         |
+  [factorized entropy code z → z bitstream]                       |
+        |                                                         |
+        v                                                         |
+  hyper_synthesis  [decode z → scale map σ, 160×8×128]            |
+        |                                                         |
+        v                                                         v
+  entropy_params  [compute P(ŷ) from σ] <-------- ŷ symbols ------+
+        |
+        v
+  ans_encoder  [64 parallel rANS streams encode ŷ symbols]
+        |
+        v
+  bs_packer  [frame header + strip packets → AXI-Stream bitstream output]
+
+
+  Timing per strip (64 rows of 1280px input):
+    pixel_buffer fill:      64 × 1280 / 1px_per_clk = 81,920 clocks (partially
+                            hidden behind previous strip's ANS encode)
+    analysis_net:           ~10,000 clocks (streaming, dominated by stage-0)
+    hyper_analysis:         ~2,000 clocks
+    hyper_synthesis:        ~2,000 clocks
+    entropy_params lookup:  ~163,840 / pipelined ≈ 2,000 clocks
+    ans_encoder:            ~2,560 clocks
+    -------------------------------------------------------
+    Total exposed latency:  ~20,000 clocks ≈ 0.1 ms per strip at 200 MHz
+
+  Full frame (17 strips of 64 rows at 1080p):
+    17 × 0.1 ms ≈ 1.7 ms encode latency (pipelined; strips overlap with fill)
+
+================================================================================
+5. ESTIMATED RESOURCE UTILIZATION
+================================================================================
+
+Device target: xczu3eg-sfvc784-1-e  (same as current DCT encoder)
+Quantization: INT8 weights and activations throughout
+
+Module                      LUTs      FFs      DSP      BRAM36
+----------------------------------------------------------------------
+strip_ctrl                   200      150        0         0
+pixel_buffer                 150      100        0         4
+analysis_net               12,000    4,000       30        57
+hyper_analysis              2,000      800        8         6
+hyper_synthesis             2,000      800        8         8
+quantizer                     100       50        0         0
+entropy_params                500      200        0        24
+ans_encoder                 8,000    3,000       64         8
+bs_packer                     500      300        0         0
+weight_rom                    200      100        0        12
+enc_ctrl (reused)             150      200        0         0
+----------------------------------------------------------------------
+TOTAL (estimated)          25,800    9,700      110       119
+
+Available (ZU3EG)          70,560  141,120      360       216
+Estimated utilization        37%       7%       31%       55%
+----------------------------------------------------------------------
+
+  vs. Current DCT encoder:  37% LUT / 8% FF / 61% DSP / 37% BRAM
+
+The neural encoder uses ~65% fewer DSPs (110 vs 221) and similar LUTs, at the
+cost of ~50% more BRAM (119 vs 79.5). Both designs fit on the ZU3EG.
+BRAM utilisation at 55% leaves ~97 BRAM36 free — sufficient headroom for
+the v2.0 optical flow P-frame extension (~30 additional BRAM36 estimated).
+
+Note: The entropy_params CDF ROM (24 BRAM36) can be halved to 12 BRAM36 by
+switching to Laplace CDF and exploiting symmetry, reducing total BRAM to ~107
+(49% utilisation). Recommended if the v2.0 P-frame extension is planned.
+
+================================================================================
+6. PIPELINE LATENCY SUMMARY
+================================================================================
+
+Stage                         Latency (clocks @ 200 MHz)   Notes
+----------------------------------------------------------------------
+pixel_buffer fill (64 rows)   81,920                        Hidden behind ANS
+analysis_net (per strip)       ~10,000                      Streaming, stage-0 dom.
+hyper_analysis (per strip)      ~2,000
+hyper_synthesis (per strip)     ~2,000
+entropy_params (per strip)      ~2,000                      Pipelined lookup
+ans_encoder (per strip)         ~2,560                      64-stream parallel
+bs_packer                           1                       Per byte
+
+End-to-end latency per strip:   ~20,000 clocks = 0.10 ms @ 200 MHz
+End-to-end latency per frame:   ~1.7 ms  (17 strips, pipelined, 1080p30)
+                                vs. current encoder ~8–25 ms per frame
+
+Note: The pixel_buffer fill (82K clocks) dominates the total strip period but
+is fully hidden behind the previous strip's processing when input is continuous.
+The exposed encode latency is only the ~20K clocks of the processing pipeline.
+
+================================================================================
+7. BITSTREAM FORMAT
+================================================================================
+
+Frame header (per frame):
+  [8 bits]  magic         0xNE (Neural Encoder)
+  [16 bits] frame_width
+  [16 bits] frame_height
+  [8 bits]  model_id      identifies rate-distortion operating point
+  [8 bits]  num_strips    ceil(frame_height / 64)
+
+Per-strip packet:
+  [16 bits] strip_y       top row of this strip
+  [16 bits] z_len         byte length of z (hyperprior) bitstream
+  [16 bits] y_len         byte length of y (main latent) bitstream
+  [z_len bytes]  z_bitstream   ANS-coded hyperprior side information
+  [y_len bytes]  y_bitstream   64-stream interleaved ANS-coded latent
+
+The z bitstream uses a simpler factorized entropy code (not ANS) since z is
+small (~80×4×64 symbols per strip). This simplifies the decoder.
+The y bitstream is 64-stream interleaved rANS; decoder requires 64 parallel
+rANS decoders (trivially parallelisable on CPU/GPU ground station).
+
+================================================================================
+8. KEY PARAMETERS (CONFIGURABLE VIA AXI-LITE)
+================================================================================
+
+Parameter           Default     Notes
+----------------------------------------------------------------------
+FRAME_WIDTH         1280        Up to 3840 (4K, future)
+FRAME_HEIGHT        1080        Up to 2160 (4K, future)
+STRIP_HEIGHT        64          Must be >= 2^num_stages = 8; 64 recommended
+MODEL_ID            0           Selects weight set from weight_rom
+                                  0 = low bitrate  (λ=0.01)
+                                  1 = medium        (λ=0.05)
+                                  2 = high quality  (λ=0.10)
+ANS_STREAMS         64          Fixed at synthesis; not runtime-configurable
+LATENT_CHANNELS     128         Fixed at synthesis
+HYPER_CHANNELS       64         Fixed at synthesis
+
+AXI-Lite register map (32-bit words):
+  0x00  CTRL         [0]=enable, [1]=soft-reset
+  0x04  STATUS       [0]=busy, [1]=frame_done (W1C), [2]=error
+  0x08  WIDTH        Frame width
+  0x0C  HEIGHT       Frame height
+  0x10  MODEL_ID     Weight set selector (0–2)
+  0x14  FRAME_CNT    Encoded frame count (read-only)
+  0x18  BS_BYTES     Bitstream bytes in last frame (read-only)
+  0x1C  WEIGHT_DMA   Weight DMA control (write new weights from PS DDR)
+
+================================================================================
+9. FILE SUMMARY
+================================================================================
+
+File                    Lines   Purpose
+----------------------------------------------------------------------
+neural_enc_top.vhd      ~500    Top-level orchestration + AXI interfaces
+enc_ctrl.vhd            ~220    AXI-Lite control (reused from DCT encoder)
+strip_ctrl.vhd          ~150    Strip sequencer FSM
+pixel_buffer.vhd        ~180    Input strip ping-pong BRAM
+analysis_net.vhd        ~600    3-stage DSConv analysis transform
+dsconv_cell.vhd         ~200    Reusable DSConv building block (parameterised)
+hyper_analysis.vhd      ~200    Hyperprior analysis sub-network
+hyper_synthesis.vhd     ~200    Hyperprior synthesis sub-network
+quantizer.vhd           ~80     Uniform latent quantizer
+entropy_params.vhd      ~120    Per-symbol CDF lookup (Gaussian/Laplace ROM)
+ans_encoder.vhd         ~400    64-stream parallel rANS encoder
+bs_packer.vhd           ~180    Bitstream packer/framer (adapted from DCT enc)
+weight_rom.vhd          ~100    INT8 weight storage and DMA loader
+neural_enc_pkg.vhd      ~200    Shared types, constants, utility functions
+
+Training / software (not VHDL):
+  train/                        PyTorch training scripts (CompressAI-based)
+  train/model.py                Network definition (analysis + hyper nets)
+  train/train.py                Training loop with rate-distortion loss
+  train/export_weights.py       Export INT8 weights to .mem files for weight_rom
+  decoder/                      Ground-station decoder
+  decoder/decode.py             Python ANS decoder + synthesis network (ONNX)
+
+================================================================================
+10. TRAINING AND WEIGHT EXPORT WORKFLOW
+================================================================================
+
+1. Train analysis_net + hyper_analysis + hyper_synthesis using CompressAI
+   framework on aerial video dataset (UAVid, VisDrone, or proprietary).
+   Loss: L = R + λD  where R = estimated bitrate, D = MS-SSIM or MSE.
+   Train 3 models at λ = {0.01, 0.05, 0.10} for 3 quality operating points.
+
+2. Quantization-aware training (QAT): fine-tune with simulated INT8
+   quantization for 10–20 epochs. Target: < 0.3 dB PSNR degradation vs FP32.
+
+3. Export weights: run export_weights.py to produce .mem files (one per layer)
+   in the format expected by weight_rom.vhd initialization.
+
+4. Pack weights into weight_rom: model_id 0/1/2 occupy separate address ranges
+   in weight_rom. The PS ARM can switch models at runtime by writing MODEL_ID
+   and pulsing WEIGHT_DMA to reload the MAC arrays.
+
+================================================================================
+11. V2.0 PLANNED EXTENSIONS
+================================================================================
+
+Temporal P-frame coding (single reference, low-delay):
+  - Add lightweight optical flow module (2-level SpyNet, depthwise separable)
+  - Warp previous reconstructed strip from DDR reference buffer
+  - Encode residual through analysis_net (same weights, different λ)
+  - Requires: ~20 BRAM36 (flow feature buffers), ~20 DSP (flow network),
+              ~3,000 LUTs → still fits ZU3EG with headroom
+
+Chroma encoding:
+  - Currently luma-only. Add parallel 4:2:0 chroma path.
+  - Chroma at half resolution; use same analysis_net weights (finetuned)
+  - Requires: ~15 BRAM36 additional line buffers
+
+Resolution scaling to 4K:
+  - Line buffer BRAM scales linearly with frame_width. At 3840px:
+    Stage 0 line buffer triples (640→1920px). Requires ZU5EV or larger device.
+
+================================================================================
+END OF ARCHITECTURE REFERENCE
+Generated: 2026-04-24
+Target Device: Xilinx UltraScale+ Zynq MPSoC (ZU3EG or ZU5EV)
+Clock: 200 MHz
+================================================================================

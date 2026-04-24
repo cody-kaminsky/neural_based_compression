@@ -1,0 +1,586 @@
+================================================================================
+PHASE 0 — DETAILED TASK LIST WITH DEPENDENCIES
+Neural Autoencoder Encoder — Software Model and Weight Export
+================================================================================
+
+Task ID format: P0-Txx
+Dependency column lists task IDs that must complete before this task begins.
+Duration is estimated person-days for one developer.
+
+Critical path is marked with [CP].
+
+================================================================================
+SECTION 1 — ENVIRONMENT SETUP
+================================================================================
+
+P0-T01  Install Python environment
+        Action:   Create conda/venv environment. Install:
+                    PyTorch >= 2.1 (CUDA 12.x)
+                    CompressAI 1.2
+                    Brevitas (for QAT)
+                    numpy, pillow, imageio, tqdm, tensorboard
+                    onnx, onnxruntime
+                    pandas (for BD-rate computation)
+        Verify:   python -c "import compressai; import brevitas; import torch"
+                  all import without error; torch.cuda.is_available() = True
+        Deps:     none
+        Duration: 0.5 day
+
+P0-T02  Clone and verify CompressAI
+        Action:   git clone https://github.com/InterDigitalInc/CompressAI
+                  Run provided unit tests: pytest tests/
+                  Run example encode/decode on Kodak image to confirm working
+        Deps:     P0-T01
+        Duration: 0.5 day
+
+P0-T03  Acquire aerial video dataset
+        Action:   Download one of:
+                    Option A: UAVid dataset (http://uavid.nl) — 300 sequences
+                    Option B: VisDrone-VID (100 sequences)
+                    Option C: Internal drone footage (preferred)
+                  Target: >= 10 hours 1080p footage
+                  Extract frames at 1fps to produce ~36,000 training images
+                  Split: 90% train / 10% val (by sequence, not by frame)
+        Verify:   Image count >= 30,000 train, >= 3,000 val
+        Deps:     none (can start day 1 in parallel with P0-T01)
+        Duration: 1 day (mostly download/wait time)
+
+P0-T04  Write dataset loader and preprocessing pipeline
+        Action:   PyTorch Dataset class: loads images, crops 256×256 patches
+                  randomly during training, returns YUV 4:2:0 tensor.
+                  Normalise pixels to [0, 1] float32.
+                  DataLoader with num_workers=4, prefetch_factor=2.
+                  Augmentation: random horizontal flip only (no colour jitter —
+                  preserves YUV statistics important for compression).
+        Verify:   Iterate 100 batches without error. Visualise 4 sample patches.
+                  Check mean/std of dataset (expect ~0.45 / ~0.25 for aerial).
+        Deps:     P0-T01, P0-T03
+        Duration: 1 day
+
+P0-T05  Benchmark dataset throughput
+        Action:   Measure DataLoader throughput (batches/sec). Target: > 50
+                  batches/sec at batch_size=8 on training machine.
+                  If below target: increase num_workers, check disk I/O,
+                  consider caching preprocessed patches to .npy files.
+        Deps:     P0-T04
+        Duration: 0.5 day
+
+================================================================================
+SECTION 2 — FLOATING-POINT BASELINE MODEL
+================================================================================
+
+P0-T06  Implement DSConv module  [CP]
+        Action:   Write train/modules/dsconv.py
+                  Class DSConvBlock(nn.Module):
+                    - depthwise Conv2d(C_in, C_in, 3, padding=1, groups=C_in)
+                    - LeakyReLU(0.1)
+                    - pointwise Conv2d(C_in, C_out, 1)
+                    - LeakyReLU(0.1)
+                    - optional stride-2 subsampling via AvgPool2d(2,2) after dw
+                  Note: use AvgPool2d for stride (not strided conv) — easier to
+                  map to FPGA where strided conv requires careful line buffer mgmt.
+        Verify:   Unit test: input (B=2, C=3, H=64, W=64) → output
+                  (B=2, C_out, H/2, W/2) for stride-2 case.
+                  Parameter count matches manual calculation.
+        Deps:     P0-T01, P0-T02
+        Duration: 1 day
+
+P0-T07  Implement analysis_net (encoder CNN)  [CP]
+        Action:   Write train/modules/analysis.py
+                  AnalysisNet: sequential 3-stage DSConvBlock
+                    Stage 0: DSConvBlock(in_ch=3,  out_ch=64,  stride=2)
+                    Stage 1: DSConvBlock(in_ch=64, out_ch=96,  stride=2)
+                    Stage 2: DSConvBlock(in_ch=96, out_ch=128, stride=2)
+                  Output: latent y, shape (B, 128, H/8, W/8)
+        Verify:   Forward pass (B=2, 3, 256, 256) → (B, 128, 32, 32). No NaN.
+        Deps:     P0-T06
+        Duration: 0.5 day
+
+P0-T08  Implement synthesis_net (decoder CNN)
+        Action:   Write train/modules/synthesis.py
+                  SynthesisNet: mirror of AnalysisNet using transposed conv
+                    Stage 0: DSConvTranspose(128, 96, stride=2)
+                    Stage 1: DSConvTranspose(96,  64, stride=2)
+                    Stage 2: DSConvTranspose(64,   3, stride=2)
+                  Final activation: sigmoid (maps to [0,1])
+                  DSConvTranspose: pointwise 1×1 → LeakyReLU → depthwise
+                  ConvTranspose2d(C, C, 3, stride=2, output_padding=1) → LeakyReLU
+        Verify:   Forward pass (B=2, 128, 32, 32) → (B, 3, 256, 256). No NaN.
+                  Reconstruction has no checkerboard artefacts (verify visually).
+        Deps:     P0-T06
+        Duration: 1 day
+
+P0-T09  Implement hyper_analysis sub-network
+        Action:   Write train/modules/hyper.py — HyperAnalysis class
+                  abs(y) → Conv2d(128, 64, 3, padding=1) → ReLU
+                        → Conv2d(64,  64, 3, stride=2, padding=1) → ReLU
+                  Output z shape: (B, 64, H/16, W/16)
+        Verify:   Forward pass (B=2, 128, 32, 32) → (B, 64, 16, 16). No NaN.
+        Deps:     P0-T07
+        Duration: 0.5 day
+
+P0-T10  Implement hyper_synthesis sub-network
+        Action:   HyperSynthesis class in train/modules/hyper.py
+                  ConvTranspose2d(64, 64, 3, stride=2, padding=1, output_padding=1)
+                    → ReLU
+                  → Conv2d(64, 128, 3, padding=1) → ReLU (outputs scale params σ)
+                  Output σ shape: (B, 128, H/8, W/8) — same as y
+        Verify:   Forward pass (B=2, 64, 16, 16) → (B, 128, 32, 32). All σ > 0
+                  (use softplus or abs activation on output).
+        Deps:     P0-T09
+        Duration: 0.5 day
+
+P0-T11  Integrate scale hyperprior entropy model  [CP]
+        Action:   Assemble full model in train/model.py using CompressAI's
+                  GaussianConditional as the entropy model.
+                  Class NeuralEncoderModel(CompressionModel):
+                    analysis_net, synthesis_net (P0-T07, P0-T08)
+                    hyper_analysis, hyper_synthesis (P0-T09, P0-T10)
+                    gaussian_conditional = GaussianConditional(None)
+                    factorized_entropy for z
+                  forward():
+                    y = analysis_net(x)
+                    z = hyper_analysis(y)
+                    z_hat, z_likelihoods = factorized_entropy(z)
+                    scales = hyper_synthesis(z_hat)
+                    y_hat, y_likelihoods = gaussian_conditional(y, scales)
+                    x_hat = synthesis_net(y_hat)
+                    return x_hat, y_likelihoods, z_likelihoods
+        Verify:   Forward pass produces valid x_hat, likelihoods > 0,
+                  total_bits = sum(-log2(likelihoods)) is finite and positive.
+        Deps:     P0-T07, P0-T08, P0-T09, P0-T10
+        Duration: 1 day
+
+P0-T12  Write training loop  [CP]
+        Action:   Write train/train.py
+                  Loss: L = λ * D + R
+                    D = 1 - MS-SSIM(x, x_hat)   (use pytorch_msssim library)
+                    R = sum of y_likelihoods + z_likelihoods bits (per pixel)
+                  Optimizer: Adam, lr=1e-4
+                  LR schedule: cosine annealing from 1e-4 to 1e-6 over 200 epochs
+                  Gradient clip: max_norm=1.0
+                  Checkpoint: save every 10 epochs, keep best val loss
+                  Logging: tensorboard — loss, R, D, val PSNR, val bpp per epoch
+                  Command-line args: --lmbda, --epochs, --batch-size, --workers
+        Verify:   Train for 2 epochs on small dataset subset (100 images).
+                  Loss decreases. No NaN. Checkpoint saves and loads correctly.
+        Deps:     P0-T11, P0-T05
+        Duration: 2 days
+
+P0-T13  Write BD-rate evaluation script
+        Action:   Write eval/bdrate.py
+                  Encodes Kodak dataset (24 images) at 4 quality operating points.
+                  Computes PSNR and bpp for each.
+                  Runs x264 (ffmpeg) at matching quality levels.
+                  Computes Bjøntegaard Delta Rate vs x264.
+                  Outputs: rate-distortion curve plot + BD-rate number.
+        Verify:   Runs on a pretrained CompressAI model and produces plausible
+                  BD-rate number (expect ~-20% for stock CompressAI ScaleHyperprior).
+        Deps:     P0-T11
+        Duration: 1 day
+
+P0-T14  Train λ=0.01 model  [CP]
+        Action:   python train.py --lmbda 0.01 --epochs 200 --batch-size 8
+                  Expected: ~3–5 days GPU time (single A100 or equivalent).
+                  Monitor: val bpp should converge to 0.08–0.15 bpp on aerial val.
+                  If loss diverges: reduce lr to 5e-5 and resume.
+        Deps:     P0-T12, P0-T04
+        Duration: 3–5 GPU-days (can run concurrently with P0-T15, P0-T16)
+
+P0-T15  Train λ=0.05 model
+        Action:   python train.py --lmbda 0.05 --epochs 200 --batch-size 8
+                  Expected val bpp: 0.20–0.35
+        Deps:     P0-T12, P0-T04
+        Duration: 3–5 GPU-days (parallel with P0-T14)
+
+P0-T16  Train λ=0.10 model
+        Action:   python train.py --lmbda 0.10 --epochs 200 --batch-size 8
+                  Expected val bpp: 0.40–0.70
+        Deps:     P0-T12, P0-T04
+        Duration: 3–5 GPU-days (parallel with P0-T14)
+
+P0-T17  Validate FP32 models: BD-rate vs x264
+        Action:   Run eval/bdrate.py on all 3 checkpoints.
+                  Target: BD-rate <= -30% (30% bitrate saving vs x264 at same PSNR)
+                  on aerial validation set.
+                  If target not met: check for training issues (loss not converged,
+                  dataset preprocessing bug). Do not proceed to QAT until this passes.
+        Deps:     P0-T13, P0-T14, P0-T15, P0-T16
+        Duration: 0.5 day
+
+================================================================================
+SECTION 3 — STRIP-MODE ADAPTATION
+================================================================================
+
+P0-T18  Implement strip encoder in Python  [CP]
+        Action:   Add strip_encode(image, strip_height=64, overlap=2) method
+                  to NeuralEncoderModel in train/model.py.
+                  Procedure:
+                    Split image into strips of strip_height rows.
+                    First strip: top-pad with replicated rows (border reflect).
+                    Subsequent strips: prepend last `overlap` rows of previous
+                    strip as top context (not transmitted — decoder does same).
+                    Encode each strip independently through analysis_net etc.
+                    Concatenate strip bitstreams with strip headers.
+                  Note: strip_encode runs inference only (no gradient).
+        Deps:     P0-T11
+        Duration: 1 day
+
+P0-T19  Write strip vs full-frame PSNR comparison test
+        Action:   Write tests/test_strip_consistency.py
+                  For each of 10 aerial validation images:
+                    full_psnr   = encode_full_frame(img) → decode → PSNR
+                    strip_psnr  = strip_encode(img, strip_height=64) → decode → PSNR
+                    seam_psnr   = PSNR measured only on strip boundary rows (±4 rows)
+                  Report: mean PSNR difference (full vs strip), max seam drop.
+                  Pass criteria: mean difference < 0.1 dB, max seam drop < 0.3 dB.
+        Deps:     P0-T18
+        Duration: 1 day
+
+P0-T20  Run strip consistency test on all 3 models
+        Action:   python tests/test_strip_consistency.py --ckpt checkpoints/
+                  If any model fails:
+                    Increase overlap rows (2 → 4 → 8) and rerun.
+                    If still failing at overlap=8: flag for architecture review.
+                  Document passing overlap value in config.
+        Deps:     P0-T19, P0-T17
+        Duration: 0.5 day
+
+================================================================================
+SECTION 4 — QUANTIZATION-AWARE TRAINING (QAT)
+================================================================================
+
+P0-T21  Prototype INT8 quantization on one layer
+        Action:   Using Brevitas, apply INT8 weight + activation quantization to
+                  analysis_net stage 0 only. Verify:
+                    - Forward pass produces INT8 tensors at quantized nodes
+                    - PSNR drop vs FP32 on 10 images is < 1 dB (for this stage only)
+                  This is a risk-reduction step before committing to full QAT.
+        Deps:     P0-T17
+        Duration: 1 day
+
+P0-T22  Define full INT8 QAT model
+        Action:   Write train/modules/quant_model.py
+                  Wrap NeuralEncoderModel with Brevitas quantizers:
+                    - QuantConv2d (INT8 weights, INT8 activations) for all conv layers
+                    - Keep entropy model parameters (GaussianConditional scales) FP32
+                    - Keep final sigmoid in FP32
+                  Verify quantized model is loadable from FP32 checkpoint
+                  (init quantized model, load FP32 state dict with strict=False,
+                  verify all quantized layers have weights within INT8 range).
+        Deps:     P0-T21
+        Duration: 1 day
+
+P0-T23  QAT fine-tune λ=0.01 model  [CP]
+        Action:   python train.py --lmbda 0.01 --qat --epochs 20
+                    --resume checkpoints/lmbda0.01_best.pth
+                  Reduced learning rate: 1e-5 (10× lower than original).
+                  Monitor: val PSNR should remain within 0.3 dB of FP32 checkpoint.
+                  If degradation > 0.3 dB after 20 epochs: extend to 40 epochs.
+        Deps:     P0-T22, P0-T14, P0-T20
+        Duration: 0.5–1 GPU-day (much shorter than FP32 training)
+
+P0-T24  QAT fine-tune λ=0.05 model
+        Action:   Same as P0-T23 but resuming from λ=0.05 checkpoint.
+        Deps:     P0-T22, P0-T15, P0-T20
+        Duration: 0.5–1 GPU-day (parallel with P0-T23)
+
+P0-T25  QAT fine-tune λ=0.10 model
+        Action:   Same as P0-T23 but resuming from λ=0.10 checkpoint.
+        Deps:     P0-T22, P0-T16, P0-T20
+        Duration: 0.5–1 GPU-day (parallel with P0-T23)
+
+P0-T26  Validate INT8 QAT quality degradation
+        Action:   Run eval/bdrate.py on all 3 INT8 QAT checkpoints.
+                  Compare to FP32 baselines from P0-T17.
+                  Pass criterion: PSNR degradation <= 0.3 dB at all bitrate points.
+                  Document results in eval/qat_validation_report.txt.
+                  If any model fails: see P0-T27 (remediation).
+        Deps:     P0-T23, P0-T24, P0-T25
+        Duration: 0.5 day
+
+P0-T27  QAT remediation (conditional — only if P0-T26 fails)
+        Action:   If PSNR drop > 0.3 dB:
+                    Try 1: Extend QAT to 40 epochs.
+                    Try 2: Use INT8 weights / INT16 activations for worst layers.
+                    Try 3: Reduce quantization to INT8/FP16 mixed for stage 0
+                           (highest-rate, most sensitive layer).
+                  Re-run P0-T26 validation after each attempt.
+        Deps:     P0-T26
+        Duration: 1–3 days (contingency; may not be needed)
+
+================================================================================
+SECTION 5 — WEIGHT EXPORT AND BITSTREAM FORMAT
+================================================================================
+
+P0-T28  Write weight extraction utility
+        Action:   Write train/export/extract_weights.py
+                  Loads INT8 QAT checkpoint.
+                  For each conv layer: extract weight tensor as numpy INT8 array.
+                  For each bias: extract as INT16 array (biases stay higher precision).
+                  Outputs: dict of {layer_name: numpy_array}.
+                  Unit test: round-trip (extract → re-load) produces identical
+                  outputs as original checkpoint on 5 test inputs.
+        Deps:     P0-T26
+        Duration: 1 day
+
+P0-T29  Write .mem file serialiser (Xilinx BRAM init format)
+        Action:   Write train/export/to_mem.py
+                  Converts INT8 numpy arrays to Xilinx .mem format:
+                    4 INT8 values packed into one 32-bit hex word
+                    Big-endian byte order within each word
+                    One word per line, no address prefix (pure data .mem)
+                  Output naming: weights_{model_id}_{stage}_{dw|pw}.mem
+                  Also write weight_layout.txt describing byte offset and shape
+                  of each layer within the packed weight_rom BRAM address space.
+        Verify:   Load .mem file back into numpy, compare to original. Zero diff.
+        Deps:     P0-T28
+        Duration: 1 day
+
+P0-T30  Write C header array serialiser (for VHDL testbench)
+        Action:   Write train/export/to_cheader.py
+                  Converts same INT8 numpy arrays to C-style header files:
+                    static const int8_t weights_m0_s0_dw[] = { ... };
+                  These are #included in VHDL simulation testbenches that use
+                  the VHPI/DPI C interface to feed weights into the simulation.
+                  Alternatively: write as plain hex text files readable by
+                  $readmemh in VHDL testbenches (simpler, preferred).
+        Verify:   Load hex text file in a Python unit test, compare to original.
+        Deps:     P0-T28
+        Duration: 0.5 day
+
+P0-T31  Export all weights for 3 model_ids
+        Action:   Run full export pipeline for λ=0.01, 0.05, 0.10 INT8 checkpoints.
+                  Verify file sizes match expected weight counts:
+                    analysis_net total:  ~20 KB per model
+                    hyper nets total:    ~28 KB per model
+                    Total per model:     ~48 KB
+                    All 3 models:        ~144 KB → fits in weight_rom BRAM
+        Deps:     P0-T29, P0-T30, P0-T26
+        Duration: 0.5 day
+
+P0-T32  Write Python ANS encoder (matching VHDL spec)  [CP]
+        Action:   Write decoder/ans.py — rANS encoder and decoder in Python.
+                  Must exactly match the VHDL ans_encoder.vhd spec:
+                    State range: [L, bL) where L=2^23, b=256
+                    Symbol encoding: x' = (x // freq) * M + cumfreq + (x % freq)
+                    Normalisation: while x >= freq * (L // M): emit x & 0xFF, x >>= 8
+                    M = 2^12 (probability precision, 12-bit probabilities)
+                  64-stream interleaving: symbols assigned round-robin to streams.
+                  Output: interleaved byte stream matching VHDL stream order.
+                  This is a critical correctness dependency for the VHDL testbench.
+        Verify:   Encode 1000 random symbols → decode → verify perfect recovery.
+                  Verify stream order with a known test vector (hand-computed).
+        Deps:     P0-T01
+        Duration: 2 days
+
+P0-T33  Write Laplace CDF probability table generator
+        Action:   Write decoder/cdf_table.py
+                  Computes P(ŷ=k | σ) = CDF_Laplace(k+0.5, σ) - CDF_Laplace(k-0.5, σ)
+                  for σ in {σ_min, ..., σ_max} (256 log-spaced values)
+                  and k in {-255, ..., +255} (512 symbols, exploit symmetry for k>=0).
+                  Quantise probabilities to 12-bit integers (0–4095), ensure sum = 4096.
+                  Export as .mem file for entropy_params.vhd BRAM initialisation.
+                  Also export as numpy .npy for use in decode.py.
+        Verify:   Probabilities sum to 4096 for every σ value (no rounding errors).
+                  PSNR of Laplace model matches Gaussian model within 0.2 dB on
+                  5 test images (Laplace is slightly less accurate but simpler).
+        Deps:     P0-T01
+        Duration: 1 day
+
+P0-T34  Write factorized entropy coder for z (hyperprior side info)
+        Action:   Write decoder/factorized.py
+                  Simple non-parametric entropy coder for the hyperprior z symbols.
+                  Uses CompressAI's EntropyBottleneck learned distribution.
+                  Encodes z with standard arithmetic coding (not ANS — z is small,
+                  ~1280 symbols per strip, serial coding is acceptable).
+                  Output: z_bitstream bytes.
+        Verify:   Encode z → decode z → verify exact recovery.
+        Deps:     P0-T11
+        Duration: 1 day
+
+P0-T35  Write bitstream format specification  [CP]
+        Action:   Write docs/bitstream_spec.txt defining byte-exact format:
+                  Frame header: magic(1B) + width(2B) + height(2B) +
+                                model_id(1B) + num_strips(1B)
+                  Strip packet:  strip_y(2B) + z_len(2B) + y_len(2B) +
+                                 z_bitstream(z_len B) + y_bitstream(y_len B)
+                  y_bitstream:   64-stream interleaved rANS bytes, stream 0 first,
+                                 then stream 1, etc., padded to 8-byte boundary.
+                  Document byte order (big-endian), padding rules, EOF marker.
+                  This spec is the contract between the VHDL encoder and decode.py.
+                  Phase 1 VHDL work (bs_packer) cannot begin without this document.
+        Verify:   Code-review with someone who will implement the VHDL decoder side.
+                  Manually trace a 2-strip encode and verify format matches spec.
+        Deps:     P0-T32, P0-T34
+        Duration: 1 day
+
+P0-T36  Write decode.py (full ground-station decoder)
+        Action:   Write decoder/decode.py
+                  Parses bitstream per P0-T35 spec.
+                  For each strip:
+                    Read z_bitstream → factorized_entropy.decompress(z_bytes) → z_hat
+                    z_hat → hyper_synthesis → σ scale map
+                    Read y_bitstream → ans_decode(y_bytes, σ) → ŷ
+                    ŷ → synthesis_net (FP32 ONNX) → strip pixels
+                    Store strip pixels, accounting for overlap rows (discard top
+                    `overlap` rows of each strip except strip 0)
+                  Assemble strips → full reconstructed frame.
+                  Output: PNG or YUV file.
+        Verify:   Run on a bitstream produced by software encoder, compare
+                  decoded output to ground truth PSNR.
+        Deps:     P0-T32, P0-T33, P0-T34, P0-T35, P0-T08
+        Duration: 2 days
+
+P0-T37  End-to-end software encode → decode round-trip test
+        Action:   Write tests/test_e2e_roundtrip.py
+                  For each of 3 models:
+                    Encode 5 Kodak images with strip_encode()
+                    Decode with decode.py
+                    Measure PSNR and bpp
+                    Assert PSNR matches FP32 baseline within 0.4 dB
+                    Assert bitstream parses cleanly (no truncation, no errors)
+        Pass:     All 15 cases (5 images × 3 models) pass.
+        Deps:     P0-T36, P0-T31, P0-T20
+        Duration: 1 day
+
+================================================================================
+SECTION 6 — GOLDEN REFERENCE VECTORS
+================================================================================
+
+P0-T38  Select test images
+        Action:   Choose 5 test images:
+                    3 from Kodak dataset (kodim05, kodim15, kodim23 — diverse content)
+                    2 aerial (one low-texture like open field, one high-texture
+                    like urban/forest canopy)
+                  These images must NOT appear in the training or validation set.
+                  Resize all to 1080×720 (standard 16:9, 720p for simulation speed).
+                  Save as lossless PNG and as raw YUV 4:2:0 binary files.
+        Deps:     none (can do on day 1)
+        Duration: 0.5 day
+
+P0-T39  Run software encoder and save intermediate tensors
+        Action:   Modify strip_encode() to save intermediate tensors to .npy files:
+                    y_fp32    analysis_net output (float32, before quantization)
+                    y_int8    quantized latent ŷ (int8)
+                    z_int8    quantized hyperprior ẑ (int8)
+                    sigma     scale map from hyper_synthesis (float32)
+                    probs     probability values from entropy_params (float32)
+                  Run for all 5 images × 3 model_ids = 15 test cases.
+                  Save: reference_vectors/{model_id}/{image_name}/{tensor_name}.npy
+        Deps:     P0-T37, P0-T38
+        Duration: 1 day
+
+P0-T40  Save reference bitstreams and decoded outputs
+        Action:   For each of 15 test cases, save:
+                    {image}_{model}.bin      compressed bitstream (exact bytes)
+                    {image}_{model}_dec.png  decoded output image
+                    {image}_{model}_psnr.txt PSNR and bpp measurements
+                  Also save strip-level bitstreams for each strip individually
+                  (17 strips × 15 cases = 255 strip bitstreams) — these feed
+                  individual VHDL module simulation testbenches in Phase 3.
+        Deps:     P0-T39
+        Duration: 0.5 day
+
+P0-T41  Write and run verification script for reference vectors
+        Action:   Write tests/verify_reference_vectors.py
+                  Reloads each saved .npy tensor, re-encodes with same model,
+                  checks that output matches saved tensor to within float precision.
+                  Decodes each saved .bin bitstream with decode.py, checks PSNR
+                  matches saved _psnr.txt value.
+                  This guards against disk corruption or version mismatch later.
+        Pass:     All 15 test cases verified, all PSNR values within 0.01 dB.
+        Deps:     P0-T40
+        Duration: 0.5 day
+
+P0-T42  Package reference vectors for VHDL testbench use
+        Action:   Write train/export/pack_reference_vectors.py
+                  Converts .npy tensors to hex text files readable by $readmemh.
+                  File per tensor: one hex word per line, INT8 values zero-padded.
+                  Also generates a manifest JSON listing all files, their shapes,
+                  and the expected PSNR for each test case.
+                  Output directory: reference_vectors/vhdl_format/
+        Verify:   Load one hex file back and compare to original .npy.
+        Deps:     P0-T41
+        Duration: 1 day
+
+================================================================================
+DEPENDENCY GRAPH SUMMARY
+================================================================================
+
+The following shows the critical path and parallel tracks:
+
+Track A (dataset, runs in parallel with everything in weeks 1-2):
+  P0-T03 → P0-T04 → P0-T05
+
+Track B (model definition):
+  P0-T01 → P0-T02 → P0-T06 → P0-T07 ─┬─→ P0-T09 → P0-T10 ─┐
+                                        │                      ├→ P0-T11 → P0-T12
+                           P0-T06 ─────→ P0-T08 ──────────────┘
+
+Track C (training — GPU-bound, dominates calendar time):
+  P0-T12 + P0-T05 → P0-T14/15/16 (parallel) → P0-T17
+
+Track D (strip mode):
+  P0-T11 → P0-T18 → P0-T19 → P0-T20 (needs P0-T17)
+
+Track E (QAT):
+  P0-T17 + P0-T20 → P0-T21 → P0-T22 → P0-T23/24/25 (parallel) → P0-T26 → P0-T27?
+
+Track F (export):
+  P0-T26 → P0-T28 → P0-T29/30 → P0-T31
+
+Track G (ANS and bitstream — can start early, independent of training):
+  P0-T01 → P0-T32 (independent of model training)
+  P0-T01 → P0-T33 (independent of model training)
+  P0-T11 → P0-T34
+  P0-T32 + P0-T34 → P0-T35  ← PHASE 1 GATE (bs_packer cannot start without this)
+
+Track H (decoder and round-trip):
+  P0-T35 + P0-T08 → P0-T36 → P0-T37 (needs P0-T31, P0-T20)
+
+Track I (reference vectors):
+  P0-T37 + P0-T38 → P0-T39 → P0-T40 → P0-T41 → P0-T42  ← PHASE 3 GATE
+
+================================================================================
+PHASE 0 GATE CRITERIA (must all pass before Phase 1 testbench work begins)
+================================================================================
+
+G1  P0-T17 complete: FP32 models achieve >= -30% BD-rate vs x264
+G2  P0-T26 complete: INT8 QAT degradation <= 0.3 dB PSNR on all 3 models
+G3  P0-T20 complete: Strip mode PSNR difference < 0.1 dB, seam drop < 0.3 dB
+G4  P0-T35 complete: Bitstream format specification written and reviewed
+G5  P0-T37 complete: End-to-end software round-trip passes all 15 test cases
+G6  P0-T42 complete: Reference vectors packaged in VHDL-compatible hex format
+
+Phase 1 VHDL work that can begin once G4 is met (earlier than other Phase 1 work):
+  Item 1.G (bs_packer adaptation) — only needs bitstream spec
+  Item 1.D (ans_encoder VHDL) — only needs P0-T32 (ANS Python spec)
+  Item 1.E (entropy_params ROM) — only needs P0-T33 (CDF table)
+
+================================================================================
+TOTAL PHASE 0 EFFORT ESTIMATE
+================================================================================
+
+                              Person-days   Calendar-days (1 developer)
+Environment + dataset             2.5             3
+Model definition                  5.0             5
+Training (3 models × ~4 GPU-days) 12 GPU-days    ~5 (parallel GPU runs)
+Strip mode                        2.5             3
+QAT (3 models × ~0.75 GPU-days)   2.25 GPU-days  ~3 (parallel GPU runs)
+Export pipeline                   3.5             4
+ANS + bitstream spec              4.0             4
+Decoder + round-trip              3.0             3
+Reference vectors                 3.0             3
+----------------------------------------------------------------------
+Total (sequential)               ~15 person-days
+Total (calendar, 1 developer)    ~24 calendar-days  (~5 weeks)
+Total (calendar, 2 developers)   ~14 calendar-days  (~3 weeks)
+
+GPU training time (not blocked on developer): ~18 GPU-days total
+If using 3× parallel GPUs: ~6 calendar days of GPU time.
+
+================================================================================
+END OF PHASE 0 TASK LIST
+Generated: 2026-04-24
+================================================================================

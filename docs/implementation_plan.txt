@@ -1,0 +1,423 @@
+================================================================================
+NEURAL AUTOENCODER ENCODER — IMPLEMENTATION PLAN
+================================================================================
+Project:  drone_video_compression / neural_encoder
+Goal:     Functional FPGA encoder, 1080p30, luma-only v1.0
+Device:   xczu3eg-sfvc784-1-e (Zynq UltraScale+)
+Clock:    200 MHz
+================================================================================
+
+OVERVIEW
+--------
+This plan is divided into 5 phases:
+
+  Phase 0 — Software model and weight export         (Python, ~3 weeks)
+  Phase 1 — VHDL building blocks                     (VHDL, ~4 weeks)
+  Phase 2 — Integration and full pipeline            (VHDL, ~3 weeks)
+  Phase 3 — Simulation and functional verification   (testbench, ~3 weeks)
+  Phase 4 — Hardware bring-up and tuning             (board, ~2 weeks)
+
+Dependencies are strictly sequential between phases. Within each phase,
+independent items can be developed in parallel.
+
+================================================================================
+PHASE 0 — SOFTWARE MODEL AND WEIGHT EXPORT
+================================================================================
+Goal: Produce a verified INT8 model, exported weights, and a reference
+      software encoder/decoder pair that the VHDL testbenches can compare against.
+
+Dependency: Must complete before Phase 1 testbench work begins.
+
+------------------------------------------------------------------------
+Step 0.1 — Environment setup
+------------------------------------------------------------------------
+  Install: PyTorch >= 2.1, CompressAI 1.2, ONNX, numpy, pillow
+  Clone CompressAI: https://github.com/InterDigitalInc/CompressAI
+  Set up aerial video dataset:
+    Option A: UAVid (http://uavid.nl) — 300 sequences, aerial semantic scenes
+    Option B: VisDrone-VID — 96 sequences, drone surveillance footage
+    Option C: Proprietary drone footage (preferred for domain adaptation)
+  Target dataset size: >= 10 hours of 1080p footage, split 90/10 train/val.
+
+  Deliverable: Working training environment, dataset loaded and preprocessed.
+
+------------------------------------------------------------------------
+Step 0.2 — Floating-point baseline model
+------------------------------------------------------------------------
+  Define model in train/model.py using CompressAI's ScaleHyperprior as base.
+  Modifications vs. stock CompressAI:
+    - Replace standard conv layers with depthwise separable conv (DSConv)
+    - 3 analysis stages (not 4), channels [64, 96, 128]
+    - Hyperprior channels: 64
+    - Leaky ReLU activation (slope 0.1) instead of GDN (GDN not FPGA-friendly)
+
+  Train 3 models:
+    λ=0.01  (low bitrate, ~0.08–0.15 bpp at 1080p)
+    λ=0.05  (medium,      ~0.20–0.35 bpp)
+    λ=0.10  (high quality,~0.40–0.70 bpp)
+
+  Training:  ~200 epochs, batch 8, Adam lr=1e-4, cosine decay.
+             Patches: 256×256 crops. ~3–5 days GPU time per model.
+
+  Validation metric: BD-rate vs. H.264 (x264 veryslow) on aerial val set.
+  Target: >= 30% BD-rate reduction (i.e. 30% fewer bits at same PSNR).
+
+  Deliverable: 3 floating-point .pth checkpoint files, validation curves.
+
+------------------------------------------------------------------------
+Step 0.3 — Strip-mode adaptation
+------------------------------------------------------------------------
+  Modify model to process 64-row strips instead of full frames.
+  Handle border padding: replicate last 2 rows of previous strip as top padding
+  for current strip (prevents visible seams at strip boundaries).
+
+  Verify that strip-mode encoding matches full-frame encoding within 0.1 dB
+  PSNR on the validation set. If not: increase overlap rows or adjust padding.
+
+  Deliverable: Updated model.py with strip_encode() method, unit test comparing
+               strip vs. full-frame output on 10 validation images.
+
+------------------------------------------------------------------------
+Step 0.4 — Quantization-aware training (QAT)
+------------------------------------------------------------------------
+  Apply INT8 QAT using PyTorch's FX graph mode quantization or Brevitas.
+  Quantize: all conv weights (INT8), all activations (INT8 after each layer).
+  Keep: entropy model parameters in FP32 (small, not on FPGA critical path).
+
+  Fine-tune 20 epochs from FP32 checkpoint. Target: <= 0.3 dB PSNR drop vs FP32.
+  If degradation exceeds 0.3 dB: increase fine-tune epochs or use INT8/FP16 mixed.
+
+  Deliverable: 3 INT8 QAT checkpoints. Validation report showing FP32 vs INT8
+               PSNR curves across bitrate operating points.
+
+------------------------------------------------------------------------
+Step 0.5 — Weight export
+------------------------------------------------------------------------
+  Write train/export_weights.py:
+    - Load INT8 QAT checkpoint
+    - Extract weight tensors for each conv layer
+    - Quantize biases to INT16
+    - Pack into .mem files (Xilinx BRAM init format, 32-bit hex words)
+    - One .mem file per model_id per layer
+    - Also export as C header arrays for simulation testbench use
+
+  Naming convention:
+    weights_m0_s0_dw.mem    model 0, stage 0, depthwise
+    weights_m0_s0_pw.mem    model 0, stage 0, pointwise
+    weights_m0_s1_dw.mem    model 0, stage 1, depthwise
+    ... etc.
+
+  Write decoder/decode.py:
+    - Load synthesis network weights (FP32 for ground station)
+    - Accept bitstream file as input
+    - Parse frame/strip headers
+    - Decode z with factorized entropy model
+    - Run hyper_synthesis to get scale map σ
+    - Run 64-stream ANS decode for y
+    - Run synthesis_net (reverse of analysis_net) to reconstruct pixels
+    - Output PNG or YUV file
+
+  Deliverable: .mem weight files for all 3 models, decode.py, end-to-end
+               encode→decode round-trip test with PSNR measurement.
+
+------------------------------------------------------------------------
+Step 0.6 — Golden reference vectors
+------------------------------------------------------------------------
+  Run the software encoder on 5 test images (standard Kodak set + 2 aerial):
+    - Save intermediate tensors: y latent, ŷ quantized, σ scale map, z latent
+    - Save final bitstream and decoded output
+  These become the golden reference for VHDL simulation in Phase 3.
+
+  Deliverable: Reference vector files (.npy tensors + .bin bitstreams) for 5
+               test images × 3 model_ids = 15 test cases.
+
+================================================================================
+PHASE 1 — VHDL BUILDING BLOCKS
+================================================================================
+Goal: Implement and unit-test each VHDL module independently.
+      All modules verified in simulation before integration.
+
+Items 1.A through 1.G can be developed in parallel.
+
+------------------------------------------------------------------------
+Item 1.A — neural_enc_pkg.vhd (shared types and constants)
+------------------------------------------------------------------------
+  Define: integer array types for weight ROMs, AXI interface record types,
+          constants (STRIP_HEIGHT=64, LATENT_CH=128, HYPER_CH=64, ANS_STREAMS=64),
+          utility functions (log2_ceil, clip_8bit, leaky_relu_int8).
+
+  Testbench: Simple compile-time checks, function unit tests in simulation.
+
+------------------------------------------------------------------------
+Item 1.B — dsconv_cell.vhd (parameterised DSConv building block)
+------------------------------------------------------------------------
+  Single reusable module implementing one depthwise separable conv stage.
+  Parameters: CIN, COUT, STRIDE (1 or 2), DATA_WIDTH (8).
+
+  Internal structure:
+    line_buffer_dw: 3-row × WIDTH × CIN BRAM line buffer for depthwise
+    mac_array_dw:   CIN parallel 9-tap FIR filters (depthwise 3×3)
+    activation_dw:  leaky ReLU (INT8)
+    mac_array_pw:   CIN×COUT systolic MAC array (pointwise 1×1)
+    activation_pw:  leaky ReLU (INT8)
+    stride_ctrl:    emit every other row/pixel if STRIDE=2
+
+  This is the highest-risk VHDL module. Implement and verify first.
+  Key challenge: correct handling of stride-2 output timing with line buffers.
+
+  Testbench:
+    - Apply known INT8 inputs, compare outputs to Python reference (Step 0.6)
+    - Verify stride-2 subsampling gives correct output dimensions
+    - Verify latency (first valid output on clock N after valid input begins)
+    - Verify backpressure (m_tready held low, inputs must stall)
+
+  Estimated time: 10 days including testbench.
+
+------------------------------------------------------------------------
+Item 1.C — quantizer.vhd
+------------------------------------------------------------------------
+  Round Q8.8 fixed-point to nearest INT8 integer. Saturate to [-128, 127].
+  1-cycle pipeline, no backpressure.
+
+  Testbench: Exhaustive check of all 65,536 Q8.8 input values.
+  Estimated time: 1 day.
+
+------------------------------------------------------------------------
+Item 1.D — ans_encoder.vhd (64-stream parallel rANS)
+------------------------------------------------------------------------
+  Implement 64 independent rANS encoder instances.
+  Each instance: 32-bit state x, encodes one INT8 symbol per clock.
+  Normalisation: when x >= b*L (b=256, L=2^23), emit byte and rescale x.
+
+  Per-instance encode step:
+    1. Look up (cumfreq, freq) from 256-entry probability table (12-bit probs)
+    2. If x >= freq * (L/M) (where M=2^12): emit x[7:0], x >>= 8
+    3. x = (x / freq) * M + cumfreq + (x mod freq)
+       Division by freq: multiply by reciprocal (256-entry recip LUT, 1 DSP)
+
+  All 64 instances share one probability table (read-only ROM, 256×12-bit).
+  Symbols are fed round-robin to streams: symbol 0 → stream 0,
+                                          symbol 1 → stream 1, ...
+                                          symbol 64 → stream 0, etc.
+
+  Output: 64 FIFO outputs (byte streams), read in round-robin by bs_packer.
+
+  Testbench:
+    - Encode known symbol sequence, verify bitstream matches Python ANS encoder
+    - Verify 64-stream interleaving matches decode.py expectation
+    - Stress test with all-zero symbols and all-max symbols
+
+  Estimated time: 7 days.
+
+------------------------------------------------------------------------
+Item 1.E — entropy_params.vhd (CDF lookup ROM)
+------------------------------------------------------------------------
+  Precompute Laplace CDF table for 256 σ values × 512 symbol values.
+  Store as 256×512 ROM of 12-bit probability values (Q0.12).
+  Due to Laplace symmetry: P(+k) = P(-k), so store only k >= 0 (256 entries),
+  halving the ROM to 256×256×12-bit = 786,432 bits ≈ 24 BRAM18.
+
+  Lookup is fully pipelined: (σ_idx, symbol) → probability in 2 cycles.
+
+  Testbench:
+    - Compare BRAM contents against Python-computed CDF values
+    - Verify symmetry handling for negative symbols
+
+  Estimated time: 3 days.
+
+------------------------------------------------------------------------
+Item 1.F — pixel_buffer.vhd
+------------------------------------------------------------------------
+  Ping-pong BRAM buffer: bank A fills while bank B drains, then swap.
+  AXI-Stream input (1 byte/clock), 8-byte-wide read output to analysis_net.
+  Buffer size: 2 banks × 64 rows × 1280 bytes = 163,840 bytes → 5 BRAM36.
+
+  Testbench:
+    - Stream in 64 rows of test pixels, verify readout matches input order
+    - Verify bank swap at row 64, re-fill begins correctly
+
+  Estimated time: 2 days.
+
+------------------------------------------------------------------------
+Item 1.G — bs_packer.vhd (adapted from DCT encoder)
+------------------------------------------------------------------------
+  Adapt existing bs_packer.vhd to handle the neural encoder's strip packet
+  format: prepend frame header on first strip, prepend strip header on each
+  strip, write z_len and y_len fields after respective sub-bitstreams complete.
+  Otherwise identical to existing DCT encoder bitstream packer.
+
+  Estimated time: 2 days (mostly adaptation, not new code).
+
+================================================================================
+PHASE 2 — INTEGRATION
+================================================================================
+Goal: Connect all Phase 1 modules into the full pipeline. Verify end-to-end
+      data flow in simulation before hardware.
+
+------------------------------------------------------------------------
+Item 2.A — analysis_net.vhd
+------------------------------------------------------------------------
+  Instantiate 3 × dsconv_cell, connect with BRAM line buffers between stages.
+  Add weight loading from weight_rom at startup (one-time DMA from PS).
+
+  Testbench: feed reference strip, compare y latent output to golden vectors.
+  Estimated time: 4 days.
+
+------------------------------------------------------------------------
+Item 2.B — hyper_analysis.vhd + hyper_synthesis.vhd
+------------------------------------------------------------------------
+  2-stage sub-networks using dsconv_cell with smaller dimensions.
+  hyper_analysis: 128ch → 64ch → 64ch (2 pointwise stages, stride-2 on stage 1)
+  hyper_synthesis: mirror, 64ch → 64ch → 128ch (transposed / bilinear upsample)
+
+  Testbench: verify σ map matches Python reference.
+  Estimated time: 4 days.
+
+------------------------------------------------------------------------
+Item 2.C — weight_rom.vhd + startup DMA
+------------------------------------------------------------------------
+  Pack all .mem weight files into BRAM. Implement DMA sequencer that distributes
+  weights to each module's local weight BRAM on reset release.
+  PS ARM writes MODEL_ID to AXI-Lite; neural_enc_top reloads weights.
+
+  Estimated time: 3 days.
+
+------------------------------------------------------------------------
+Item 2.D — strip_ctrl.vhd + neural_enc_top.vhd
+------------------------------------------------------------------------
+  Top-level integration. Wire all modules. Implement strip_ctrl FSM.
+  Add frame header emission logic and frame counter.
+  Ensure AXI-Stream video input backpressure propagates correctly when
+  pixel_buffer is full and analysis_net is not ready.
+
+  Estimated time: 5 days.
+
+================================================================================
+PHASE 3 — SIMULATION AND FUNCTIONAL VERIFICATION
+================================================================================
+Goal: Full end-to-end simulation. Bitstream decoded by decode.py must
+      produce PSNR within 0.1 dB of software INT8 QAT model.
+
+------------------------------------------------------------------------
+Item 3.A — End-to-end simulation testbench
+------------------------------------------------------------------------
+  Testbench feeds AXI-Stream pixel input from test image files (Phase 0.6),
+  captures AXI-Stream bitstream output, writes to file.
+  Python script (test/verify.py) decodes bitstream with decode.py, compares
+  PSNR to golden reference.
+
+  Target: PSNR within 0.1 dB of software reference on all 15 test cases.
+  Failure mode to watch: wrong byte ordering in ANS stream interleave.
+
+  Estimated time: 5 days.
+
+------------------------------------------------------------------------
+Item 3.B — Latency measurement
+------------------------------------------------------------------------
+  Measure simulated cycle count from first pixel in to first bitstream byte out.
+  Compare to architecture reference targets (Section 6).
+  If latency exceeds target by > 20%: profile which stage dominates and optimise.
+
+  Common issues:
+    - BRAM read latency not pipelined (add register stage)
+    - ANS normalisation stall (increase FIFO depth between ANS and bs_packer)
+
+------------------------------------------------------------------------
+Item 3.C — Backpressure and corner cases
+------------------------------------------------------------------------
+  Verify:
+    - m_tready held low on output: encoder stalls gracefully, no data lost
+    - All-zero strip (black frame): ans_encoder produces minimal output
+    - Frame width not multiple of 8: pixel_buffer pads correctly
+    - Last strip shorter than 64 rows: strip_ctrl issues partial strip correctly
+    - Rapid frame-start pulses (back-to-back frames): no state leak between frames
+
+========================================================================
+PHASE 4 — HARDWARE BRING-UP
+================================================================================
+Goal: Working encoder on ZU3EG board. Bitstream decoded correctly by
+      decode.py running on laptop ground station.
+
+------------------------------------------------------------------------
+Item 4.A — Synthesis and implementation
+------------------------------------------------------------------------
+  Vivado synthesis + implementation targeting xczu3eg-sfvc784-1-e.
+  Timing constraints: 200 MHz for all logic; 300 MHz for BRAM read paths.
+  Expected: 2–3 synthesis runs to close timing.
+  Watch: DSP cascade paths in ans_encoder (reciprocal multiply chain may need
+         register insertion to close 200 MHz timing).
+
+------------------------------------------------------------------------
+Item 4.B — PS-PL integration
+------------------------------------------------------------------------
+  Integrate neural_enc_top into Zynq block design.
+  Connect: S_AXI_HP0 for video DMA, S_AXI_LITE for control, M_AXIS for bitstream.
+  PS ARM code (C, bare-metal or Linux):
+    - Configure encoder registers (width, height, model_id)
+    - Trigger weight DMA on startup
+    - Stream video from MIPI CSI-2 or V4L2 capture via DMA to S_AXI_HP0
+    - Receive bitstream via DMA and forward over RF link (UDP socket)
+
+------------------------------------------------------------------------
+Item 4.C — Ground station decoder bring-up
+------------------------------------------------------------------------
+  Run decode.py on laptop receiving UDP bitstream from drone.
+  Verify decoded frames match expectations visually and by PSNR measurement
+  on known test sequences.
+
+------------------------------------------------------------------------
+Item 4.D — Performance and quality validation
+------------------------------------------------------------------------
+  Measure on real drone footage:
+    - Bitrate at each model_id operating point
+    - PSNR / MS-SSIM vs. x264 at same bitrate
+    - Measured encode latency (logic analyser on strip_done pulse vs. SOF)
+    - Power consumption (INA3221 on VCCINT rail)
+
+  Target (v1.0 luma-only):
+    - >= 30% bitrate reduction vs. x264 at equivalent PSNR
+    - <= 5 ms encode latency at 1080p30
+    - <= 8W total PL power
+
+================================================================================
+RISK REGISTER
+================================================================================
+
+Risk                        Likelihood  Impact  Mitigation
+----------------------------------------------------------------------
+QAT degrades quality > 0.3dB   Medium    High   Increase QAT epochs; try
+                                                 INT8/FP16 mixed precision
+ANS timing doesn't close 200MHz Medium   Medium  Pipeline the reciprocal
+                                                 multiply; may need 2 cycles
+BRAM exceeds 55% estimate       Low      Medium  Switch to Laplace CDF table
+                                                 (saves 12 BRAM36) or use
+                                                 ZU5EV device
+Strip seams visible in output   Low      Medium  Increase overlap rows from 2
+                                                 to 8; retrain with larger overlap
+No aerial training dataset      Low      High    Use Cityscapes + KITTI as
+                                                 proxy; fine-tune later
+Ground station decode too slow  Low      Low     Use ONNX Runtime with INT8
+                                                 quantized synthesis net; or
+                                                 add dedicated decode FPGA
+
+================================================================================
+MILESTONE SUMMARY
+================================================================================
+
+Milestone           Phase   Target     Deliverable
+----------------------------------------------------------------------
+M0: SW model ready    0     Week 5     3x INT8 QAT checkpoints + golden vectors
+M1: DSConv verified   1     Week 7     dsconv_cell sim passes all test vectors
+M2: ANS verified      1     Week 8     ans_encoder sim matches Python ANS
+M3: Integration sim   2     Week 11    Full pipeline sim, correct bitstream
+M4: E2E verified      3     Week 14    PSNR within 0.1dB of SW reference
+M5: Timing closed     4     Week 15    Vivado impl: 200MHz, fits ZU3EG
+M6: HW bring-up       4     Week 17    Decoded frames on laptop from real drone
+
+Total estimated duration: 17 weeks (sequential; parallel execution within phases
+compresses to ~12–13 weeks with 2 developers).
+
+================================================================================
+END OF IMPLEMENTATION PLAN
+Generated: 2026-04-24
+================================================================================

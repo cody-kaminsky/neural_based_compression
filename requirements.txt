@@ -1,0 +1,13 @@
+torch>=2.1.0
+compressai>=1.2.0
+brevitas>=0.10.0
+numpy
+Pillow
+imageio
+tqdm
+tensorboard
+onnx
+onnxruntime
+pandas
+pytorch-msssim
+pytest
