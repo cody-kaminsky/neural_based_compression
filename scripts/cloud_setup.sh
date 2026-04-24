@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Cloud instance setup for neural_based_compression training.
 # Tested on Ubuntu with CUDA pre-installed (RunPod / Vast.ai).
+# Requires a pod with 3 GPUs. On RunPod, select '3x RTX 4090' under GPU count when creating the pod.
 set -euo pipefail
 
 REPO_URL="https://github.com/cody-kaminsky/neural_based_compression"
@@ -63,25 +64,20 @@ echo "==> Splitting sequences into train/val (90/10)"
 python scripts/split_dataset.py dataset/frames/ dataset/train/ dataset/val/
 
 # ---------------------------------------------------------------------------
-# 5. Training — lambda sweep
+# 5. Training — parallel lambda sweep (one process per GPU)
 # ---------------------------------------------------------------------------
-mkdir -p logs
+mkdir -p logs checkpoints/lmbda_0.001 checkpoints/lmbda_0.005 checkpoints/lmbda_0.01
 
-for lmbda in 0.001 0.005 0.01; do
-    echo ""
-    echo "==> Training lambda=$lmbda"
-    mkdir -p "checkpoints/lmbda_$lmbda"
-    python -m train.train \
-        --lmbda "$lmbda" \
-        --epochs 200 \
-        --batch-size 16 \
-        --workers 4 \
-        --amp \
-        --amp-dtype bfloat16 \
-        --data-dir dataset/ \
-        --checkpoint-dir "checkpoints/lmbda_$lmbda/" \
-        2>&1 | tee "logs/train_lmbda_$lmbda.log"
-done
+echo "==> Launching 3 training jobs in parallel (GPU 0, 1, 2)"
+
+CUDA_VISIBLE_DEVICES=0 python -m train.train --lmbda 0.001 --epochs 200 --batch-size 16 --workers 4 --amp --amp-dtype bfloat16 --data-dir dataset/ --checkpoint-dir checkpoints/lmbda_0.001/ 2>&1 | tee logs/train_lmbda_0.001.log &
+
+CUDA_VISIBLE_DEVICES=1 python -m train.train --lmbda 0.005 --epochs 200 --batch-size 16 --workers 4 --amp --amp-dtype bfloat16 --data-dir dataset/ --checkpoint-dir checkpoints/lmbda_0.005/ 2>&1 | tee logs/train_lmbda_0.005.log &
+
+CUDA_VISIBLE_DEVICES=2 python -m train.train --lmbda 0.01  --epochs 200 --batch-size 16 --workers 4 --amp --amp-dtype bfloat16 --data-dir dataset/ --checkpoint-dir checkpoints/lmbda_0.01/  2>&1 | tee logs/train_lmbda_0.01.log &
+
+wait
+echo "All 3 models done."
 
 # ---------------------------------------------------------------------------
 # 6. Done
