@@ -174,6 +174,9 @@ def train_one_epoch(
         aux_optimizer.zero_grad()
         aux_loss = model.entropy_bottleneck.loss()
         aux_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [p for g in aux_optimizer.param_groups for p in g["params"]], 1.0
+        )
         aux_optimizer.step()
 
         total_loss += metrics["loss"]
