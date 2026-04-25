@@ -1,18 +1,17 @@
 import torch.nn as nn
-from .dsconv import DSConvBlock
+from .dsconv import ConvBlock
 
 
 class AnalysisNet(nn.Module):
-    def __init__(self):
+    def __init__(self, N=128, M=192):
         super().__init__()
-        self.stage0 = DSConvBlock(3, 64, stride=2)
-        self.stage1 = DSConvBlock(64, 96, stride=2)
-        self.stage2 = DSConvBlock(96, 128, stride=2)
-        # Learnable per-channel scale so y has sufficient magnitude for quantization.
-        # Without this, default-init activations stay in (-0.5, 0.5) and all round
-        # to 0 under hard quantization in eval mode, giving val_bpp=0 indefinitely.
+        self.stage0 = ConvBlock(3, N, stride=2)
+        self.stage1 = ConvBlock(N, N, stride=2)
+        # Final stage has no GDN — Ballé 2018 convention; lets latent magnitude
+        # be set by the rate-distortion objective rather than a fixed normalizer.
+        self.final = nn.Conv2d(N, M, 5, stride=2, padding=2)
+
     def forward(self, x):
         x = self.stage0(x)
         x = self.stage1(x)
-        x = self.stage2(x)
-        return x * 4.0
+        return self.final(x)

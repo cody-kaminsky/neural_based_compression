@@ -34,8 +34,10 @@ class AerialVideoDataset(Dataset):
         val_fraction: float = 0.1,
         seed: int = 42,
         augment: bool | None = None,
+        subset_fraction: float = 1.0,
     ) -> None:
         assert split in ("train", "val"), "split must be 'train' or 'val'"
+        assert 0.0 < subset_fraction <= 1.0, "subset_fraction must be in (0, 1]"
         self.patch_size = patch_size
         self.split = split
         self.augment = (split == "train") if augment is None else augment
@@ -53,6 +55,12 @@ class AerialVideoDataset(Dataset):
             selected = sorted(indices[:n_val])
         else:
             selected = sorted(indices[n_val:])
+
+        # Optional subset for fast iteration. Applied after the train/val split
+        # so train and val never overlap regardless of subset_fraction.
+        if subset_fraction < 1.0:
+            n_keep = max(1, int(len(selected) * subset_fraction))
+            selected = selected[:n_keep]
 
         self.files = [all_files[i] for i in selected]
 
