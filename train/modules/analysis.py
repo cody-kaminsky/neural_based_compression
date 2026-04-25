@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from .dsconv import DSConvBlock
 
@@ -12,10 +11,8 @@ class AnalysisNet(nn.Module):
         # Learnable per-channel scale so y has sufficient magnitude for quantization.
         # Without this, default-init activations stay in (-0.5, 0.5) and all round
         # to 0 under hard quantization in eval mode, giving val_bpp=0 indefinitely.
-        self.y_scale = nn.Parameter(torch.ones(128, 1, 1) * 4.0)
-
     def forward(self, x):
         x = self.stage0(x)
         x = self.stage1(x)
         x = self.stage2(x)
-        return x * self.y_scale
+        return x * 4.0
