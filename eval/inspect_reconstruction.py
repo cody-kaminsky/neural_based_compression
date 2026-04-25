@@ -32,7 +32,11 @@ def main() -> None:
     # Load checkpoint
     ckpt = torch.load(args.ckpt, map_location=device)
     model = NeuralEncoderModel().to(device)
-    model.load_state_dict(ckpt["model"])
+    # strict=False: checkpoint contains entropy_bottleneck CDF buffers
+    # (_offset/_quantized_cdf/_cdf_length) populated by the training script's
+    # update(force=True) call. The fresh model has them at size [0]. We don't
+    # need them — forward() uses the soft (noise-based) likelihood path.
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
 
     # Load image, crop to multiple of 8 (matches val transform)
