@@ -9,12 +9,7 @@ from train.modules.hyper import HyperAnalysis, HyperSynthesis
 
 
 def _ste_round(x: torch.Tensor) -> torch.Tensor:
-    """Round with straight-through gradient: round() in forward, identity in backward.
-
-    Replaces CompressAI's additive-noise soft quantization so that training and
-    eval both see integer-valued latents. This closes the train/eval bpp gap that
-    caused val_bpp=0 collapse when y values were small enough to round to 0.
-    """
+    """Round with straight-through gradient: round() in forward, identity in backward."""
     return x + (x.round() - x).detach()
 
 
@@ -39,16 +34,21 @@ class NeuralEncoderModel(nn.Module):
         y = self.analysis_net(x)
         z = self.hyper_analysis(y)
 
-        # STE quantization: identical integer-valued latents in train and eval.
-        # Likelihoods are computed directly via the entropy models' internal
-        # _likelihood methods, bypassing their noise-based training path.
+        # Get likelihoods via standard CompressAI path (noise in training, round in eval).
+        # We call these just for the likelihood values — z_hat and y_hat below are
+        # computed separately with STE so the synthesis always sees integer-valued latents.
+        _, z_likelihoods = self.entropy_bottleneck(z)
+
+        # STE z_hat: training and eval both use rounded integers for hyper_synthesis.
+        # This makes the scales (and therefore y_likelihoods) consistent across modes.
         z_hat = _ste_round(z)
-        z_likelihoods = self.entropy_bottleneck._likelihood(z_hat).clamp(min=1e-9)
-
         scales = self.hyper_synthesis(z_hat)
-        y_hat = _ste_round(y)
-        y_likelihoods = self.gaussian_conditional._likelihood(y_hat, scales).clamp(min=1e-9)
+        _, y_likelihoods = self.gaussian_conditional(y, scales)
 
+        # STE y_hat for synthesis: forces the synthesis net to decode from rounded
+        # integers in both training and eval. Without this, training uses noisy y
+        # (which can be decoded even when y≈0), while eval uses round(y)=0 → collapse.
+        y_hat = _ste_round(y)
         x_hat = self.synthesis_net(y_hat)
         x_hat = x_hat[:, :, :h, :w]
 
