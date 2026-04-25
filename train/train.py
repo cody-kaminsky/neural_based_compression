@@ -52,7 +52,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="checkpoints/")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     p.add_argument("--patch-size", type=int, default=256)
+    p.add_argument("--warmup-epochs", type=int, default=20,
+                   help="Epochs to anneal λ from max(λ,0.5) down to target λ")
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# λ warmup schedule
+# ---------------------------------------------------------------------------
+
+def effective_lmbda(epoch: int, target: float, warmup_epochs: int) -> float:
+    """Cosine anneal λ from max(target, 0.5) down to target over warmup_epochs.
+
+    Prevents posterior collapse: at low λ the rate gradient dominates from the
+    start and pushes y→0 before the model learns to reconstruct anything.
+    """
+    start = max(target, 0.5)
+    if epoch >= warmup_epochs or start == target:
+        return target
+    alpha = (1 - math.cos(math.pi * epoch / warmup_epochs)) / 2
+    return start + (target - start) * alpha
 
 
 # ---------------------------------------------------------------------------
@@ -232,12 +251,13 @@ def main() -> None:
     best_val_loss = math.inf
 
     for epoch in range(start_epoch, args.epochs):
+        lmbda = effective_lmbda(epoch, args.lmbda, args.warmup_epochs)
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, aux_optimizer, args.lmbda, device, epoch, writer
+            model, train_loader, optimizer, aux_optimizer, lmbda, device, epoch, writer
         )
         # Update entropy bottleneck CDFs so val likelihoods are meaningful
         model.entropy_bottleneck.update(force=True)
-        val_metrics = validate(model, val_loader, args.lmbda, device)
+        val_metrics = validate(model, val_loader, lmbda, device)
         scheduler.step()
 
         writer.add_scalar("val/loss", val_metrics["loss"], epoch)
@@ -245,7 +265,7 @@ def main() -> None:
         writer.add_scalar("val/bpp", val_metrics["bpp"], epoch)
 
         print(
-            f"[Epoch {epoch+1}/{args.epochs}] "
+            f"[Epoch {epoch+1}/{args.epochs}] lmbda={lmbda:.4f}  "
             f"train_loss={train_loss:.4f}  val_loss={val_metrics['loss']:.4f}  "
             f"val_psnr={val_metrics['psnr']:.2f} dB  val_bpp={val_metrics['bpp']:.4f}"
         )
