@@ -4,17 +4,17 @@ import torch.nn as nn
 class DSConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch)
+        # Strided depthwise conv so downsampling is learnable and preserves signal magnitude.
+        # AvgPool2d was shrinking activations too aggressively, causing y to collapse to 0
+        # under hard quantization in eval mode.
+        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch)
         self.act1 = nn.LeakyReLU(0.1, inplace=True)
         self.pointwise = nn.Conv2d(in_ch, out_ch, 1)
         self.act2 = nn.LeakyReLU(0.1, inplace=True)
-        self.pool = nn.AvgPool2d(2, 2) if stride == 2 else None
 
     def forward(self, x):
         x = self.act1(self.depthwise(x))
         x = self.act2(self.pointwise(x))
-        if self.pool is not None:
-            x = self.pool(x)
         return x
 
 
