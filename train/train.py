@@ -107,10 +107,12 @@ def save_checkpoint(state: dict, path: str) -> None:
     torch.save(state, path)
 
 
-def load_checkpoint(path: str, model: nn.Module, optimizer: Adam) -> int:
+def load_checkpoint(path: str, model: nn.Module, optimizer: Adam, aux_optimizer: Adam) -> int:
     ckpt = torch.load(path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    if "aux_optimizer" in ckpt:
+        aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
     return ckpt.get("epoch", 0)
 
 
@@ -122,6 +124,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: Adam,
+    aux_optimizer: Adam,
     lmbda: float,
     device: torch.device,
     epoch: int,
@@ -133,8 +136,9 @@ def train_one_epoch(
 
     for step, x in enumerate(loader):
         x = x.to(device)
-        optimizer.zero_grad()
 
+        # Main optimizer step
+        optimizer.zero_grad()
         out = model(x)
         loss, metrics = compute_loss(
             x, out["x_hat"], out["y_likelihoods"], out["z_likelihoods"], lmbda
@@ -143,15 +147,22 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+        # Aux optimizer step: trains entropy bottleneck quantile parameters
+        aux_optimizer.zero_grad()
+        aux_loss = model.entropy_bottleneck.loss()
+        aux_loss.backward()
+        aux_optimizer.step()
+
         total_loss += metrics["loss"]
 
         if step % 50 == 0:
             print(
                 f"Epoch {epoch+1} [{step}/{len(loader)}]  "
                 f"loss={metrics['loss']:.4f}  bpp={metrics['bpp']:.4f}  "
-                f"psnr={metrics['psnr']:.2f} dB"
+                f"psnr={metrics['psnr']:.2f} dB  aux={aux_loss.item():.4f}"
             )
         writer.add_scalar("train/loss", metrics["loss"], global_step + step)
+        writer.add_scalar("train/aux_loss", aux_loss.item(), global_step + step)
 
     return total_loss / len(loader)
 
@@ -201,12 +212,18 @@ def main() -> None:
     )
 
     model = NeuralEncoderModel().to(device)
-    optimizer = Adam(model.parameters(), lr=args.lr)
+
+    # Separate main params (all except entropy bottleneck quantiles) from aux params.
+    # EntropyBottleneck trains its quantile parameters via a dedicated aux loss.
+    main_params = [p for n, p in model.named_parameters() if not n.endswith(".quantiles")]
+    aux_params = [p for n, p in model.named_parameters() if n.endswith(".quantiles")]
+    optimizer = Adam(main_params, lr=args.lr)
+    aux_optimizer = Adam(aux_params, lr=1e-3)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     start_epoch = 0
     if args.resume and os.path.isfile(args.resume):
-        start_epoch = load_checkpoint(args.resume, model, optimizer)
+        start_epoch = load_checkpoint(args.resume, model, optimizer, aux_optimizer)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -216,8 +233,10 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, args.lmbda, device, epoch, writer
+            model, train_loader, optimizer, aux_optimizer, args.lmbda, device, epoch, writer
         )
+        # Update entropy bottleneck CDFs so val likelihoods are meaningful
+        model.entropy_bottleneck.update(force=True)
         val_metrics = validate(model, val_loader, args.lmbda, device)
         scheduler.step()
 
@@ -239,6 +258,7 @@ def main() -> None:
             "epoch": epoch + 1,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "aux_optimizer": aux_optimizer.state_dict(),
             "val_loss": val_metrics["loss"],
         }
 

@@ -27,7 +27,8 @@ class NeuralEncoderModel(nn.Module):
         x_hat = self.synthesis_net(y_hat)
         return {
             "x_hat": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "y_likelihoods": y_likelihoods,
+            "z_likelihoods": z_likelihoods,
         }
 
     def compress(self, x):
