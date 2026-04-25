@@ -52,26 +52,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="checkpoints/")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     p.add_argument("--patch-size", type=int, default=256)
-    p.add_argument("--warmup-epochs", type=int, default=20,
-                   help="Epochs to anneal λ from max(λ,0.5) down to target λ")
+    p.add_argument("--warmup-epochs", type=int, default=5,
+                   help="Epochs to ramp rate-term scale from 0 to 1")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# λ warmup schedule
+# Rate-term warmup schedule
 # ---------------------------------------------------------------------------
 
-def effective_lmbda(epoch: int, target: float, warmup_epochs: int) -> float:
-    """Cosine anneal λ from max(target, 0.5) down to target over warmup_epochs.
+def rate_scale_for_epoch(epoch: int, warmup_epochs: int) -> float:
+    """Linear ramp of rate-term scale from 0 (epoch 0) to 1 (epoch warmup_epochs).
 
-    Prevents posterior collapse: at low λ the rate gradient dominates from the
-    start and pushes y→0 before the model learns to reconstruct anything.
+    Epoch 0 is pure autoencoder training (rate term zeroed) so synthesis learns
+    to use the latent before the rate gradient starts pushing y→0. λ warmup was
+    not enough because R competes with λ*D from step 0 regardless of λ.
     """
-    start = max(target, 0.5)
-    if epoch >= warmup_epochs or start == target:
-        return target
-    alpha = (1 - math.cos(math.pi * epoch / warmup_epochs)) / 2
-    return start + (target - start) * alpha
+    if warmup_epochs <= 0 or epoch >= warmup_epochs:
+        return 1.0
+    return epoch / warmup_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +88,7 @@ def compute_loss(
     y_likelihoods: torch.Tensor,
     z_likelihoods: torch.Tensor,
     lmbda: float,
+    rate_scale: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     b, _, h, w = x.shape
 
@@ -108,7 +108,7 @@ def compute_loss(
     R = rate_from_likelihoods(y_likelihoods, b, h, w) + \
         rate_from_likelihoods(z_likelihoods, b, h, w)
 
-    loss = lmbda * D + R
+    loss = lmbda * D + rate_scale * R
 
     # PSNR for logging
     mse = torch.mean((x_rgb - x_hat_rgb) ** 2)
@@ -145,6 +145,7 @@ def train_one_epoch(
     optimizer: Adam,
     aux_optimizer: Adam,
     lmbda: float,
+    rate_scale: float,
     device: torch.device,
     epoch: int,
     writer: SummaryWriter,
@@ -160,7 +161,8 @@ def train_one_epoch(
         optimizer.zero_grad()
         out = model(x)
         loss, metrics = compute_loss(
-            x, out["x_hat"], out["y_likelihoods"], out["z_likelihoods"], lmbda
+            x, out["x_hat"], out["y_likelihoods"], out["z_likelihoods"],
+            lmbda, rate_scale,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -251,21 +253,23 @@ def main() -> None:
     best_val_loss = math.inf
 
     for epoch in range(start_epoch, args.epochs):
-        lmbda = effective_lmbda(epoch, args.lmbda, args.warmup_epochs)
+        rate_scale = rate_scale_for_epoch(epoch, args.warmup_epochs)
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, aux_optimizer, lmbda, device, epoch, writer
+            model, train_loader, optimizer, aux_optimizer,
+            args.lmbda, rate_scale, device, epoch, writer,
         )
         # Update entropy bottleneck CDFs so val likelihoods are meaningful
         model.entropy_bottleneck.update(force=True)
-        val_metrics = validate(model, val_loader, lmbda, device)
+        val_metrics = validate(model, val_loader, args.lmbda, device)
         scheduler.step()
 
         writer.add_scalar("val/loss", val_metrics["loss"], epoch)
         writer.add_scalar("val/psnr", val_metrics["psnr"], epoch)
         writer.add_scalar("val/bpp", val_metrics["bpp"], epoch)
+        writer.add_scalar("train/rate_scale", rate_scale, epoch)
 
         print(
-            f"[Epoch {epoch+1}/{args.epochs}] lmbda={lmbda:.4f}  "
+            f"[Epoch {epoch+1}/{args.epochs}] rate_scale={rate_scale:.3f}  "
             f"train_loss={train_loss:.4f}  val_loss={val_metrics['loss']:.4f}  "
             f"val_psnr={val_metrics['psnr']:.2f} dB  val_bpp={val_metrics['bpp']:.4f}"
         )
