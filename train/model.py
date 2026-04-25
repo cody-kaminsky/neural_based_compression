@@ -8,6 +8,16 @@ from train.modules.synthesis import SynthesisNet
 from train.modules.hyper import HyperAnalysis, HyperSynthesis
 
 
+def _ste_round(x: torch.Tensor) -> torch.Tensor:
+    """Round with straight-through gradient: round() in forward, identity in backward.
+
+    Replaces CompressAI's additive-noise soft quantization so that training and
+    eval both see integer-valued latents. This closes the train/eval bpp gap that
+    caused val_bpp=0 collapse when y values were small enough to round to 0.
+    """
+    return x + (x.round() - x).detach()
+
+
 class NeuralEncoderModel(nn.Module):
     def __init__(self, lmbda=0.05):
         super().__init__()
@@ -20,7 +30,6 @@ class NeuralEncoderModel(nn.Module):
         self.entropy_bottleneck = EntropyBottleneck(64)
 
     def forward(self, x):
-        # Pad to multiple of 64 (required by 3x stride-2 analysis + 1x stride-2 hyper)
         h, w = x.shape[2], x.shape[3]
         pad_h = (64 - h % 64) % 64
         pad_w = (64 - w % 64) % 64
@@ -29,12 +38,20 @@ class NeuralEncoderModel(nn.Module):
 
         y = self.analysis_net(x)
         z = self.hyper_analysis(y)
-        z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        scales = self.hyper_synthesis(z_hat)
-        y_hat, y_likelihoods = self.gaussian_conditional(y, scales)
-        x_hat = self.synthesis_net(y_hat)
 
+        # STE quantization: identical integer-valued latents in train and eval.
+        # Likelihoods are computed directly via the entropy models' internal
+        # _likelihood methods, bypassing their noise-based training path.
+        z_hat = _ste_round(z)
+        z_likelihoods = self.entropy_bottleneck._likelihood(z_hat).clamp(min=1e-9)
+
+        scales = self.hyper_synthesis(z_hat)
+        y_hat = _ste_round(y)
+        y_likelihoods = self.gaussian_conditional._likelihood(y_hat, scales).clamp(min=1e-9)
+
+        x_hat = self.synthesis_net(y_hat)
         x_hat = x_hat[:, :, :h, :w]
+
         return {
             "x_hat": x_hat,
             "y_likelihoods": y_likelihoods,
