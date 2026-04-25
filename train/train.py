@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--warmup-epochs", type=int, default=5,
                    help="Epochs to ramp rate-term scale from 0 to 1")
+    p.add_argument("--subset-fraction", type=float, default=1.0,
+                   help="Fraction of dataset to use (e.g. 0.1 for 10%) for fast iteration")
     return p.parse_args()
 
 
@@ -220,8 +222,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_ds = AerialVideoDataset(args.data, patch_size=args.patch_size, split="train")
-    val_ds = AerialVideoDataset(args.data, patch_size=args.patch_size, split="val")
+    train_ds = AerialVideoDataset(
+        args.data, patch_size=args.patch_size, split="train",
+        subset_fraction=args.subset_fraction,
+    )
+    val_ds = AerialVideoDataset(
+        args.data, patch_size=args.patch_size, split="val",
+        subset_fraction=args.subset_fraction,
+    )
+    print(f"Train: {len(train_ds)} images  Val: {len(val_ds)} images")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,

@@ -14,15 +14,15 @@ def _ste_round(x: torch.Tensor) -> torch.Tensor:
 
 
 class NeuralEncoderModel(nn.Module):
-    def __init__(self, lmbda=0.05):
+    def __init__(self, lmbda=0.05, N=128, M=192):
         super().__init__()
         self.lmbda = lmbda
-        self.analysis_net = AnalysisNet()
-        self.synthesis_net = SynthesisNet()
-        self.hyper_analysis = HyperAnalysis()
-        self.hyper_synthesis = HyperSynthesis()
+        self.analysis_net = AnalysisNet(N=N, M=M)
+        self.synthesis_net = SynthesisNet(N=N, M=M)
+        self.hyper_analysis = HyperAnalysis(N=N, M=M)
+        self.hyper_synthesis = HyperSynthesis(N=N, M=M)
         self.gaussian_conditional = GaussianConditional(None)
-        self.entropy_bottleneck = EntropyBottleneck(64)
+        self.entropy_bottleneck = EntropyBottleneck(N)
 
     def forward(self, x):
         h, w = x.shape[2], x.shape[3]
