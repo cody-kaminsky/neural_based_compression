@@ -22,6 +22,8 @@ def main() -> None:
     p.add_argument("--ckpt", required=True)
     p.add_argument("--images", required=True, help="Directory of test images")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Evaluate only the first N images (deterministic, by filename order)")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -36,6 +38,8 @@ def main() -> None:
     files = scan_image_files(args.images)
     if not files:
         raise SystemExit(f"No images found in {args.images!r}")
+    if args.limit is not None:
+        files = files[: args.limit]
     print(f"Evaluating on {len(files)} images")
 
     psnrs, msssims, bpps = [], [], []
